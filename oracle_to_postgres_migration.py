@@ -83,6 +83,10 @@ MIGRATE_FOREIGN_KEYS = True                 # add FOREIGN KEYs (applied last, af
 MIGRATE_SEQUENCES = True                    # re-create standalone Oracle sequences in Postgres
 MIGRATE_IDENTITY_COLUMNS = True             # convert Oracle IDENTITY columns to Postgres IDENTITY
 
+# Load ordering.
+RESPECT_LOAD_ORDER = False                  # True  = load tables exactly in TABLE_NAMES order
+                                            # False = auto-sort by FK dependency (parents first)
+
 # ----------------------------------------------------------------------------
 # Example of sourcing secrets instead of hard-coding (recommended):
 # ----------------------------------------------------------------------------
@@ -845,6 +849,127 @@ def migrate_identity_columns(ora_conn, pg_conn, table_name: str):
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ## 5d. Dependency-aware load ordering
+# MAGIC
+# MAGIC Some tables must load before others (parent before child). We read the foreign-key graph
+# MAGIC from `all_constraints` (type `R`) — **restricted to the tables being migrated** — and
+# MAGIC topologically sort it so every parent loads before its children (Kahn's algorithm).
+# MAGIC
+# MAGIC Robustness details:
+# MAGIC - **Self-references** (a table FK'ing itself) are ignored for ordering — a single table is
+# MAGIC   always loadable on its own; the FK is satisfied later by the deferred FK pass.
+# MAGIC - **Cycles** (e.g. A→B→A) cannot be fully ordered. They are detected, logged, and broken by
+# MAGIC   emitting the lowest-remaining-dependency tables in a stable order; those rows rely on the
+# MAGIC   deferred FK pass for integrity.
+# MAGIC - **Deterministic**: ties broken alphabetically, so the same input always yields the same order.
+# MAGIC - FKs pointing at tables **outside** the migration set are ignored for ordering (we can't load
+# MAGIC   what we're not migrating), but are reported so you know they exist.
+
+# COMMAND ----------
+
+def build_fk_dependency_graph(ora_conn, table_names):
+    """
+    Build the FK dependency graph for the given tables.
+
+    Returns (deps, external_refs) where:
+      deps[child] = set(parents)  — parents that must load before `child`
+                                    (self-refs removed; only in-scope parents kept)
+      external_refs[child] = set(parents outside the migration set)
+    """
+    in_scope = {t.upper() for t in table_names}
+    owner = ORACLE_SCHEMA.upper()
+
+    deps = {t: set() for t in table_names}
+    # Map uppercase -> original spelling so we preserve the caller's casing.
+    canonical = {t.upper(): t for t in table_names}
+    external_refs = {}
+
+    cur = ora_conn.cursor()
+    cur.execute(
+        """
+        SELECT c.table_name AS child_table, rc.table_name AS parent_table
+        FROM all_constraints c
+        JOIN all_constraints rc
+          ON rc.owner = c.r_owner AND rc.constraint_name = c.r_constraint_name
+        WHERE c.owner = :owner AND c.constraint_type = 'R' AND c.status = 'ENABLED'
+        """,
+        owner=owner,
+    )
+    rows = cur.fetchall()
+    cur.close()
+
+    for child_raw, parent_raw in rows:
+        child_u, parent_u = child_raw.upper(), parent_raw.upper()
+        if child_u not in in_scope:
+            continue  # the dependent table isn't part of this migration
+        if parent_u == child_u:
+            continue  # self-reference — not an ordering constraint
+        if parent_u in in_scope:
+            deps[canonical[child_u]].add(canonical[parent_u])
+        else:
+            external_refs.setdefault(canonical[child_u], set()).add(parent_raw)
+
+    return deps, external_refs
+
+
+def order_tables_by_dependency(ora_conn, table_names):
+    """
+    Return table_names reordered so FK parents load before children (Kahn's algorithm).
+
+    Robust to cycles: when no zero-dependency table remains, the cycle is broken by
+    choosing the remaining table with the fewest unmet dependencies (ties alphabetical),
+    which is logged. Output always contains exactly the input tables, once each.
+    """
+    deps, external_refs = build_fk_dependency_graph(ora_conn, table_names)
+
+    if external_refs:
+        print("Note: FKs referencing tables OUTSIDE the migration set (ignored for ordering):")
+        for child, parents in sorted(external_refs.items()):
+            print(f"  - {child} -> {', '.join(sorted(parents))}")
+
+    # Work on a mutable copy of the dependency sets.
+    remaining = {t: set(parents) for t, parents in deps.items()}
+    ordered = []
+    placed = set()
+    cycles_broken = []
+
+    while remaining:
+        # Tables whose parents are all already placed.
+        ready = sorted(t for t, parents in remaining.items() if not (parents - placed))
+        if not ready:
+            # Cycle (or mutual dependency): break it deterministically.
+            unmet = lambda t: len(remaining[t] - placed)
+            victim = sorted(remaining, key=lambda t: (unmet(t), t))[0]
+            cycles_broken.append(victim)
+            ready = [victim]
+
+        for t in ready:
+            ordered.append(t)
+            placed.add(t)
+            del remaining[t]
+
+    if cycles_broken:
+        print("WARNING: FK dependency cycle(s) detected. Order forced for these tables "
+              "(they rely on the deferred FK pass for integrity):")
+        for t in cycles_broken:
+            print(f"  - {t}")
+
+    return ordered
+
+
+def resolve_load_order(ora_conn, table_names):
+    """Apply RESPECT_LOAD_ORDER: keep the given order, or sort by FK dependency."""
+    if RESPECT_LOAD_ORDER:
+        print("Load order: using TABLE_NAMES order as-is (RESPECT_LOAD_ORDER=True).")
+        return list(table_names)
+    print("Load order: resolving FK dependencies (parents before children)...")
+    ordered = order_tables_by_dependency(ora_conn, table_names)
+    print(f"Load order resolved for {len(ordered)} tables.")
+    return ordered
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ## 6. Orchestration — dump ➜ convert ➜ load ➜ constraints/identity per table; sequences + FKs around the loop
 
 # COMMAND ----------
@@ -868,6 +993,8 @@ def migrate_all_tables():
 
     try:
         table_names = discover_oracle_tables(ora_conn) if DISCOVER_TABLES else list(TABLE_NAMES)
+        # Dependency-aware ordering: load FK parents before children.
+        table_names = resolve_load_order(ora_conn, table_names)
         total = len(table_names)
         print(f"Migrating {total} tables\n" + "=" * 60)
 
