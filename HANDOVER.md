@@ -10,12 +10,15 @@
 
 A **single Databricks notebook** that migrates **400+ tables** from an Oracle database to a
 Postgres database. It was built from a short pseudocode/architecture spec (see
-*Original spec* below). The whole deliverable is one file:
+*Original spec* below). The deliverable:
 
 - **`oracle_to_postgres_migration.py`** — Databricks notebook in *source* format
   (`# Databricks notebook source` header, cells separated by `# COMMAND ----------`,
   markdown cells via `# MAGIC %md`). It imports straight into a Databricks workspace.
-- ~1085 lines, pure-Python, no widgets.
+  ~1085 lines, pure-Python, no widgets.
+- **Local Docker test environment** (`docker-compose.yml` + `docker/`) — Oracle + Postgres
+  containers with a seeded source schema so the notebook can be test-run end to end.
+  See §10 below and `docker/README.md`.
 
 ### Original spec (verbatim intent)
 ```
@@ -239,3 +242,35 @@ to pull every table in `ORACLE_SCHEMA` from `all_tables` (Option B).
 2. Read `oracle_to_postgres_migration.py` top-to-bottom (it's heavily commented + has markdown cells).
 3. To run: import into Databricks, fill in cell §1 (connections + `TABLE_NAMES`), Run All.
 4. Inspect results via the §8 summary DataFrame and the `.sql` files under `WORK_DIR`.
+
+---
+
+## 10. Local Docker test environment
+
+Lets you test-run the notebook against real databases without Databricks/cloud.
+
+**Files:**
+- `docker-compose.yml` (repo root) — `oracle` (`gvenzl/oracle-xe:21-slim`) + `postgres:16`,
+  with healthchecks and persistent volumes.
+- `docker/oracle/init/01_schema.sql` — creates `CUSTOMERS` + `ORDERS` under schema
+  `ORACLE_USER`. Deliberately covers every notebook feature: identity column, standalone
+  sequence, PK/UNIQUE/CHECK, an index, and FK `ORDERS → CUSTOMERS` (so dependency ordering +
+  deferred-FK pass are both exercised). Objects are **fully schema-qualified** so they're owned
+  by `ORACLE_USER` regardless of which privileged user the image's init runner uses.
+- `docker/oracle/init/02_seed.sql` — 3 customers + 3 orders, committed.
+- `docker/postgres/init/01_init.sql` — ensures `public` schema + `pgcrypto` (for
+  `gen_random_uuid()`, the `SYS_GUID()` target).
+- `docker/README.md` — full usage + the exact cell §1 values + verify commands + arm64 note.
+
+**Use:** `docker compose up -d`, wait for Oracle's first-run init (a few min;
+`docker compose logs -f oracle`), then run the notebook with `ORACLE_HOST=localhost`,
+`ORACLE_SERVICE_NAME=XEPDB1`, `ORACLE_SCHEMA=ORACLE_USER`, `TABLE_NAMES=["CUSTOMERS","ORDERS"]`
+(Postgres/credentials already match the notebook defaults). Expect 3+3 rows on both sides.
+
+**Notes / gotchas:**
+- Compose connection values are aligned with the notebook's §1 placeholder defaults
+  (`oracle_user`/`oracle_password`, `postgres_user`/`postgres_password`/`target_db`).
+- Oracle image is amd64; Apple Silicon → add `platform: linux/amd64` or switch to
+  `gvenzl/oracle-free:23-slim` (service name becomes `FREEPDB1`).
+- Databricks can't reach `localhost`; run the logic locally or expose the DBs to a routable host.
+- Validate compose changes with `docker compose config -q`.

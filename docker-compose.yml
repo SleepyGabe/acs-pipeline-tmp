@@ -1,0 +1,53 @@
+# Local test environment for the Oracle -> Postgres migration notebook.
+#
+#   docker compose up -d          # start both databases
+#   docker compose logs -f oracle # watch Oracle finish first-time setup (can take a few minutes)
+#   docker compose down           # stop containers (keep data)
+#   docker compose down -v        # stop and wipe data volumes
+#
+# Connection values below are intentionally aligned with the notebook's cell §1
+# defaults — see docker/README.md for the exact values to paste in.
+
+services:
+  oracle:
+    # XE 21c slim. Apple Silicon / arm64 users: see docker/README.md (use oracle-free or add platform).
+    image: gvenzl/oracle-xe:21-slim
+    container_name: ora2pg-oracle
+    ports:
+      - "1521:1521"
+    environment:
+      ORACLE_PASSWORD: oracle_admin_pw        # SYS / SYSTEM password
+      APP_USER: oracle_user                   # application user == notebook ORACLE_USER
+      APP_USER_PASSWORD: oracle_password      # == notebook ORACLE_PASSWORD
+    volumes:
+      # *.sql here run once, alphabetically, on first DB creation.
+      - ./docker/oracle/init:/container-entrypoint-initdb.d:ro
+      - oracle-data:/opt/oracle/oradata
+    healthcheck:
+      test: ["CMD", "healthcheck.sh"]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 60s
+
+  postgres:
+    image: postgres:16
+    container_name: ora2pg-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres_user            # == notebook PG_USER
+      POSTGRES_PASSWORD: postgres_password    # == notebook PG_PASSWORD
+      POSTGRES_DB: target_db                  # == notebook PG_DATABASE
+    volumes:
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres_user -d target_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  oracle-data:
+  postgres-data:
