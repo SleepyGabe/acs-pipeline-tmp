@@ -7,10 +7,32 @@ Spins up an **Oracle** (source) and a **Postgres** (target) database so you can 
 
 ```
 docker-compose.yml                 # both DB containers (lives in repo root)
+Makefile                           # make test / up / down / clean / logs
 docker/oracle/init/01_schema.sql   # creates CUSTOMERS + ORDERS (+ seq, identity, FK, index, check)
 docker/oracle/init/02_seed.sql     # inserts 3 customers + 3 orders
 docker/postgres/init/01_init.sql   # ensures target schema + pgcrypto
+docker/test/run_test.sh            # boot stack -> migrate -> diff row counts -> teardown
+docker/test/run_migration_test.py  # reuses the notebook's real functions; verifies counts
 docker/README.md                   # this file
+```
+
+## One-command test
+
+```bash
+make test                 # boot, migrate, verify row counts, tear down (exit 0 = pass)
+KEEP_UP=1 make test       # same, but leave the databases running afterwards
+```
+
+`run_test.sh` waits for both containers to report healthy, creates a throwaway venv with
+`python-oracledb` + `psycopg2-binary`, then runs `run_migration_test.py`, which **loads the
+notebook's actual functions** (no copy/paste), points them at the Docker DBs via a temp work
+dir, runs `migrate_all_tables()`, and compares `COUNT(*)` per table on both sides. Expect:
+
+```
+TABLE                    ORACLE   POSTGRES  RESULT
+CUSTOMERS                     3          3  PASS
+ORDERS                        3          3  PASS
+RESULT: PASS — all tables match.
 ```
 
 The Oracle seed deliberately exercises every notebook feature: identity column, standalone

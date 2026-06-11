@@ -261,11 +261,26 @@ Lets you test-run the notebook against real databases without Databricks/cloud.
 - `docker/postgres/init/01_init.sql` — ensures `public` schema + `pgcrypto` (for
   `gen_random_uuid()`, the `SYS_GUID()` target).
 - `docker/README.md` — full usage + the exact cell §1 values + verify commands + arm64 note.
+- `Makefile` — `make test` / `up` / `down` / `clean` / `logs`.
+- `docker/test/run_test.sh` — boots the stack, waits for healthy, makes a throwaway venv,
+  runs the migration, diffs row counts, tears down (`KEEP_UP=1` to keep DBs up). Exit 0 = pass.
+- `docker/test/run_migration_test.py` — **reuses the notebook's real functions** by exec'ing its
+  code cells into a namespace (skips markdown/`%pip`/run/Spark-summary cells, applies localhost +
+  temp-dir overrides), runs `migrate_all_tables()`, then compares `COUNT(*)` per table both sides.
+  Supports `--dry` (load only, no DB). The cell-loader + converter were validated locally with
+  stubbed drivers; the loader pattern is sensitive to how cells are split — see notes below.
 
-**Use:** `docker compose up -d`, wait for Oracle's first-run init (a few min;
-`docker compose logs -f oracle`), then run the notebook with `ORACLE_HOST=localhost`,
+**Use:** `make test` (one command). Or manually: `docker compose up -d`, wait for Oracle's
+first-run init (a few min; `make logs`), then run the notebook with `ORACLE_HOST=localhost`,
 `ORACLE_SERVICE_NAME=XEPDB1`, `ORACLE_SCHEMA=ORACLE_USER`, `TABLE_NAMES=["CUSTOMERS","ORDERS"]`
 (Postgres/credentials already match the notebook defaults). Expect 3+3 rows on both sides.
+
+**Loader caveats (for whoever maintains the test):** `run_migration_test.py` splits the notebook
+on `\n# COMMAND ----------\n` and skips any cell containing `# MAGIC`, the `migrate_all_tables()`
+run cell (kept only if it also has `def `), and the `spark`/`display` summary cell. If you add a
+runnable cell that imports something unavailable locally, or rename those markers, update the
+loader. Overrides are re-applied after every cell so `WORK_DIR` is set before the connection
+cell's `makedirs` runs.
 
 **Notes / gotchas:**
 - Compose connection values are aligned with the notebook's §1 placeholder defaults
