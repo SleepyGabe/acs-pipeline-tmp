@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Test virtualenv created by docker/test/run_test.sh
+.venv-test/
+.venv/
+venv/
+
+# Migration work dir / intermediate SQL dumps
+/dbfs/
+ora2pg/
+*.tmp
