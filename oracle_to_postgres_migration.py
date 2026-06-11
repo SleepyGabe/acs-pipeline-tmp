@@ -76,6 +76,11 @@ CREATE_TARGET_TABLE = True                  # emit / run CREATE TABLE DDL on the
 CONTINUE_ON_ERROR = True                    # keep migrating remaining tables if one fails
 KEEP_SQL_FILES = True                       # keep intermediate .sql files for auditing
 
+# Constraint / index migration (second pass).
+MIGRATE_PK_UNIQUE_CHECK = True              # add PRIMARY KEY / UNIQUE / CHECK constraints
+MIGRATE_INDEXES = True                      # re-create non-constraint indexes
+MIGRATE_FOREIGN_KEYS = True                 # add FOREIGN KEYs (applied last, after all tables load)
+
 # ----------------------------------------------------------------------------
 # Example of sourcing secrets instead of hard-coding (recommended):
 # ----------------------------------------------------------------------------
@@ -367,6 +372,15 @@ def convert_oracle_sql_to_postgres(oracle_sql_path: str, table_name: str) -> str
     print(f"  [convert] {table_name}: {oracle_sql_path} -> {out_path}")
     return out_path
 
+
+def convert_oracle_sql_text(oracle_sql_text: str) -> str:
+    """
+    Convert a chunk of Oracle SQL text (e.g. constraint / index DDL) to Postgres.
+    Used by the constraints pass. Type rules are skipped (no column type defs here);
+    function rules (NVL, SYSDATE, ...) still apply, which matters for CHECK conditions.
+    """
+    return "".join(_convert_line(line, in_ddl=False) for line in oracle_sql_text.splitlines(keepends=True))
+
 # COMMAND ----------
 
 # MAGIC %md
@@ -441,7 +455,257 @@ def load_postgres_sql(pg_conn, postgres_sql_path: str, table_name: str):
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 6. Orchestration — loop over all tables (dump ➜ convert ➜ load)
+# MAGIC ## 5b. SECOND PASS — Primary keys, unique/check constraints, indexes & foreign keys
+# MAGIC
+# MAGIC The first pass only carries column definitions + data. This pass reads the Oracle data
+# MAGIC dictionary (`all_constraints`, `all_cons_columns`, `all_indexes`, `all_ind_columns`) and
+# MAGIC reproduces the relational structure on Postgres:
+# MAGIC
+# MAGIC - **PK / UNIQUE / CHECK** and **indexes** are applied per-table (they only reference one table).
+# MAGIC - **FOREIGN KEYs** are collected across all tables and applied **last**, after every table and
+# MAGIC   its data exist, so referential integrity doesn't fail on table/row ordering.
+# MAGIC
+# MAGIC As with the data pass, DDL is dumped Oracle-flavoured ➜ converted ➜ loaded.
+
+# COMMAND ----------
+
+def _pg_ident(name: str) -> str:
+    """Quote an identifier for Postgres."""
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _pg_qualified(table_name: str) -> str:
+    return f"{_pg_ident(PG_SCHEMA)}.{_pg_ident(table_name)}"
+
+
+def _constraint_columns(ora_conn, owner: str, constraint_name: str):
+    """Ordered column list for a given constraint."""
+    cur = ora_conn.cursor()
+    cur.execute(
+        """
+        SELECT column_name
+        FROM all_cons_columns
+        WHERE owner = :owner AND constraint_name = :cname
+        ORDER BY position
+        """,
+        owner=owner, cname=constraint_name,
+    )
+    cols = [r[0] for r in cur.fetchall()]
+    cur.close()
+    return cols
+
+
+def build_oracle_constraint_ddl(ora_conn, table_name: str):
+    """
+    Read PK / UNIQUE / CHECK constraints and indexes for a table and return
+    Oracle-flavoured DDL (str). Foreign keys are intentionally excluded here.
+    """
+    owner = ORACLE_SCHEMA.upper()
+    qualified = f'"{table_name}"'
+    lines = [f"-- constraints & indexes for {table_name}"]
+
+    cur = ora_conn.cursor()
+
+    # --- PK / UNIQUE / CHECK constraints ---
+    if MIGRATE_PK_UNIQUE_CHECK:
+        cur.execute(
+            """
+            SELECT constraint_name, constraint_type, search_condition
+            FROM all_constraints
+            WHERE owner = :owner AND table_name = :tname
+              AND constraint_type IN ('P', 'U', 'C')
+              AND status = 'ENABLED'
+            ORDER BY constraint_type, constraint_name
+            """,
+            owner=owner, tname=table_name,
+        )
+        for cname, ctype, search_cond in cur.fetchall():
+            if ctype in ("P", "U"):
+                cols = _constraint_columns(ora_conn, owner, cname)
+                if not cols:
+                    continue
+                kind = "PRIMARY KEY" if ctype == "P" else "UNIQUE"
+                col_list = ", ".join(f'"{c}"' for c in cols)
+                lines.append(
+                    f'ALTER TABLE {qualified} ADD CONSTRAINT "{cname}" {kind} ({col_list});'
+                )
+            elif ctype == "C":
+                cond = (search_cond or "").strip()
+                # Skip the system-generated "COL" IS NOT NULL checks (already NOT NULL in DDL).
+                if not cond or re.match(r'^"?\w+"?\s+IS\s+NOT\s+NULL$', cond, re.IGNORECASE):
+                    continue
+                lines.append(
+                    f'ALTER TABLE {qualified} ADD CONSTRAINT "{cname}" CHECK ({cond});'
+                )
+
+    # --- Indexes (excluding those backing PK / UNIQUE constraints) ---
+    if MIGRATE_INDEXES:
+        cur.execute(
+            """
+            SELECT index_name, uniqueness
+            FROM all_indexes
+            WHERE table_owner = :owner AND table_name = :tname
+              AND index_type = 'NORMAL'
+              AND index_name NOT IN (
+                  SELECT constraint_name FROM all_constraints
+                  WHERE owner = :owner AND table_name = :tname
+                    AND constraint_type IN ('P', 'U')
+              )
+            ORDER BY index_name
+            """,
+            owner=owner, tname=table_name,
+        )
+        index_rows = cur.fetchall()
+        for index_name, uniqueness in index_rows:
+            icur = ora_conn.cursor()
+            icur.execute(
+                """
+                SELECT column_name
+                FROM all_ind_columns
+                WHERE index_owner = :owner AND index_name = :iname
+                ORDER BY column_position
+                """,
+                owner=owner, iname=index_name,
+            )
+            icols = [r[0] for r in icur.fetchall()]
+            icur.close()
+            if not icols:
+                continue
+            unique = "UNIQUE " if uniqueness == "UNIQUE" else ""
+            col_list = ", ".join(f'"{c}"' for c in icols)
+            lines.append(
+                f'CREATE {unique}INDEX "{index_name}" ON {qualified} ({col_list});'
+            )
+
+    cur.close()
+    return "\n".join(lines) + "\n"
+
+
+def build_oracle_foreign_key_ddl(ora_conn, table_name: str):
+    """Return Oracle-flavoured FOREIGN KEY DDL (str) for a single table."""
+    owner = ORACLE_SCHEMA.upper()
+    qualified = f'"{table_name}"'
+    lines = []
+
+    cur = ora_conn.cursor()
+    cur.execute(
+        """
+        SELECT c.constraint_name, c.r_owner, c.r_constraint_name,
+               c.delete_rule, rc.table_name AS ref_table
+        FROM all_constraints c
+        JOIN all_constraints rc
+          ON rc.owner = c.r_owner AND rc.constraint_name = c.r_constraint_name
+        WHERE c.owner = :owner AND c.table_name = :tname
+          AND c.constraint_type = 'R' AND c.status = 'ENABLED'
+        ORDER BY c.constraint_name
+        """,
+        owner=owner, tname=table_name,
+    )
+    for cname, r_owner, r_cname, delete_rule, ref_table in cur.fetchall():
+        local_cols = _constraint_columns(ora_conn, owner, cname)
+        ref_cols = _constraint_columns(ora_conn, r_owner, r_cname)
+        if not local_cols or not ref_cols:
+            continue
+        local_list = ", ".join(f'"{c}"' for c in local_cols)
+        ref_list = ", ".join(f'"{c}"' for c in ref_cols)
+        # Referenced table is migrated into PG_SCHEMA as well.
+        on_delete = ""
+        if delete_rule and delete_rule.upper() in ("CASCADE", "SET NULL"):
+            on_delete = f" ON DELETE {delete_rule.upper()}"
+        lines.append(
+            f'ALTER TABLE {qualified} ADD CONSTRAINT "{cname}" '
+            f'FOREIGN KEY ({local_list}) '
+            f'REFERENCES "{ref_table}" ({ref_list}){on_delete};'
+        )
+    cur.close()
+    return "\n".join(lines)
+
+
+def migrate_table_constraints(ora_conn, pg_conn, table_name: str):
+    """Dump ➜ convert ➜ load PK / UNIQUE / CHECK / indexes for one table."""
+    if not (MIGRATE_PK_UNIQUE_CHECK or MIGRATE_INDEXES):
+        return
+    oracle_ddl = build_oracle_constraint_ddl(ora_conn, table_name)
+    postgres_ddl = convert_oracle_sql_text(oracle_ddl)
+
+    ora_path = os.path.join(ORACLE_DUMP_DIR, f"{table_name}_constraints.sql")
+    pg_path = os.path.join(POSTGRES_DUMP_DIR, f"{table_name}_constraints.sql")
+    with open(ora_path, "w", encoding="utf-8") as f:
+        f.write(oracle_ddl)
+    with open(pg_path, "w", encoding="utf-8") as f:
+        f.write(f"SET search_path TO {PG_SCHEMA};\n")
+        f.write(postgres_ddl)
+
+    cur = pg_conn.cursor()
+    try:
+        executed = 0
+        for stmt in _split_sql_statements(postgres_ddl):
+            cur.execute(stmt)
+            executed += 1
+        pg_conn.commit()
+        if executed:
+            print(f"  [constr]  {table_name}: applied {executed} constraint/index statements")
+    except Exception:
+        pg_conn.rollback()
+        raise
+    finally:
+        cur.close()
+        if not KEEP_SQL_FILES:
+            os.remove(ora_path)
+            os.remove(pg_path)
+
+
+def migrate_foreign_keys(ora_conn, pg_conn, table_names):
+    """
+    Final pass: dump ➜ convert ➜ load all FOREIGN KEYs once every table exists.
+    Each FK is applied independently so one bad FK doesn't abort the rest.
+    """
+    if not MIGRATE_FOREIGN_KEYS:
+        return 0
+
+    all_fk_lines = []
+    for table_name in table_names:
+        ddl = build_oracle_foreign_key_ddl(ora_conn, table_name)
+        if ddl.strip():
+            all_fk_lines.append(ddl)
+
+    if not all_fk_lines:
+        print("No foreign keys to migrate.")
+        return 0
+
+    oracle_ddl = "-- foreign keys (all tables)\n" + "\n".join(all_fk_lines) + "\n"
+    postgres_ddl = convert_oracle_sql_text(oracle_ddl)
+
+    ora_path = os.path.join(ORACLE_DUMP_DIR, "_foreign_keys.sql")
+    pg_path = os.path.join(POSTGRES_DUMP_DIR, "_foreign_keys.sql")
+    with open(ora_path, "w", encoding="utf-8") as f:
+        f.write(oracle_ddl)
+    with open(pg_path, "w", encoding="utf-8") as f:
+        f.write(f"SET search_path TO {PG_SCHEMA};\n")
+        f.write(postgres_ddl)
+
+    applied, failed = 0, 0
+    cur = pg_conn.cursor()
+    for stmt in _split_sql_statements(postgres_ddl):
+        try:
+            cur.execute(stmt)
+            pg_conn.commit()
+            applied += 1
+        except Exception as exc:  # noqa: BLE001
+            pg_conn.rollback()
+            failed += 1
+            print(f"  [fk ERROR] {exc}")
+    cur.close()
+    print(f"Foreign keys: applied {applied}, failed {failed}")
+    if not KEEP_SQL_FILES:
+        os.remove(ora_path)
+        os.remove(pg_path)
+    return applied
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 6. Orchestration — loop over all tables (dump ➜ convert ➜ load ➜ constraints, then FKs)
 
 # COMMAND ----------
 
@@ -480,6 +744,8 @@ def migrate_all_tables():
                 postgres_sql = convert_oracle_sql_to_postgres(oracle_sql, table_name)
                 # STEP 3: load into Postgres
                 load_postgres_sql(pg_conn, postgres_sql, table_name)
+                # SECOND PASS (per-table): PK / UNIQUE / CHECK / indexes
+                migrate_table_constraints(ora_conn, pg_conn, table_name)
 
                 if not KEEP_SQL_FILES:
                     os.remove(oracle_sql)
@@ -493,6 +759,10 @@ def migrate_all_tables():
                 results["failed"].append((table_name, str(exc)))
                 if not CONTINUE_ON_ERROR:
                     raise
+
+        # FINAL PASS: foreign keys, once every table + its data exists.
+        print("\n" + "-" * 60)
+        migrate_foreign_keys(ora_conn, pg_conn, [t for t in table_names if t in results["ok"]])
 
         total_elapsed = (datetime.datetime.now() - start_all).total_seconds()
         print("\n" + "=" * 60)
