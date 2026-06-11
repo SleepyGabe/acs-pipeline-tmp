@@ -80,6 +80,8 @@ KEEP_SQL_FILES = True                       # keep intermediate .sql files for a
 MIGRATE_PK_UNIQUE_CHECK = True              # add PRIMARY KEY / UNIQUE / CHECK constraints
 MIGRATE_INDEXES = True                      # re-create non-constraint indexes
 MIGRATE_FOREIGN_KEYS = True                 # add FOREIGN KEYs (applied last, after all tables load)
+MIGRATE_SEQUENCES = True                    # re-create standalone Oracle sequences in Postgres
+MIGRATE_IDENTITY_COLUMNS = True             # convert Oracle IDENTITY columns to Postgres IDENTITY
 
 # ----------------------------------------------------------------------------
 # Example of sourcing secrets instead of hard-coding (recommended):
@@ -705,7 +707,145 @@ def migrate_foreign_keys(ora_conn, pg_conn, table_names):
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 6. Orchestration — loop over all tables (dump ➜ convert ➜ load ➜ constraints, then FKs)
+# MAGIC ## 5c. THIRD PASS — Sequences & identity columns
+# MAGIC
+# MAGIC Auto-increment behaviour in Oracle comes in two shapes, both handled here:
+# MAGIC
+# MAGIC - **Standalone sequences** (`all_sequences`) ➜ Postgres `CREATE SEQUENCE`, started at the
+# MAGIC   sequence's current high-water value. Oracle's enormous default `MAXVALUE` (28 nines)
+# MAGIC   exceeds Postgres `bigint`, so it is clamped to `NO MAXVALUE` when out of range.
+# MAGIC - **Identity columns** (`all_tab_identity_cols`, Oracle 12c+) ➜ the column is altered to
+# MAGIC   `GENERATED {ALWAYS|BY DEFAULT} AS IDENTITY` *after* its data is loaded, then `RESTART WITH
+# MAGIC   MAX(col)+1` so future inserts don't collide with migrated rows.
+# MAGIC
+# MAGIC > Pre-12c "sequence + BEFORE INSERT trigger" auto-increment is **not** auto-detected — convert
+# MAGIC > those columns to identity manually or rely on the migrated standalone sequence.
+
+# COMMAND ----------
+
+# Postgres bigint bounds — Oracle sequences can exceed these.
+_PG_BIGINT_MAX = 9223372036854775807
+_PG_BIGINT_MIN = -9223372036854775808
+
+
+def migrate_sequences(ora_conn, pg_conn):
+    """Re-create every standalone Oracle sequence in Postgres (run once)."""
+    if not MIGRATE_SEQUENCES:
+        return 0
+
+    cur = ora_conn.cursor()
+    cur.execute(
+        """
+        SELECT sequence_name, min_value, max_value, increment_by,
+               cycle_flag, cache_size, last_number
+        FROM all_sequences
+        WHERE sequence_owner = :owner
+        ORDER BY sequence_name
+        """,
+        owner=ORACLE_SCHEMA.upper(),
+    )
+    rows = cur.fetchall()
+    cur.close()
+
+    if not rows:
+        print("No sequences to migrate.")
+        return 0
+
+    statements = []
+    for name, min_v, max_v, incr, cycle_flag, cache, last_number in rows:
+        min_v = int(min_v)
+        max_v = int(max_v)
+        incr = int(incr or 1)
+        start = int(last_number or min_v)
+
+        minclause = f"MINVALUE {min_v}" if min_v >= _PG_BIGINT_MIN else "NO MINVALUE"
+        maxclause = f"MAXVALUE {max_v}" if max_v <= _PG_BIGINT_MAX else "NO MAXVALUE"
+        # Clamp the start value into the representable range as well.
+        start = max(min(start, _PG_BIGINT_MAX), _PG_BIGINT_MIN)
+        cacheclause = f"CACHE {int(cache)}" if cache and int(cache) > 1 else "CACHE 1"
+        cycleclause = "CYCLE" if (cycle_flag or "N").upper() == "Y" else "NO CYCLE"
+
+        statements.append(
+            f'CREATE SEQUENCE IF NOT EXISTS {_pg_qualified(name)} '
+            f'INCREMENT BY {incr} {minclause} {maxclause} '
+            f'START WITH {start} {cacheclause} {cycleclause};'
+        )
+
+    # Dump ➜ (no conversion needed, already Postgres) ➜ load.
+    sql_text = f"SET search_path TO {PG_SCHEMA};\n" + "\n".join(statements) + "\n"
+    pg_path = os.path.join(POSTGRES_DUMP_DIR, "_sequences.sql")
+    with open(pg_path, "w", encoding="utf-8") as f:
+        f.write(sql_text)
+
+    applied = 0
+    cur = pg_conn.cursor()
+    try:
+        for stmt in statements:
+            cur.execute(stmt)
+            applied += 1
+        pg_conn.commit()
+    except Exception:
+        pg_conn.rollback()
+        raise
+    finally:
+        cur.close()
+        if not KEEP_SQL_FILES:
+            os.remove(pg_path)
+    print(f"Sequences: created {applied}")
+    return applied
+
+
+def migrate_identity_columns(ora_conn, pg_conn, table_name: str):
+    """Convert Oracle IDENTITY columns on one table to Postgres IDENTITY columns."""
+    if not MIGRATE_IDENTITY_COLUMNS:
+        return
+
+    cur = ora_conn.cursor()
+    cur.execute(
+        """
+        SELECT column_name, generation_type
+        FROM all_tab_identity_cols
+        WHERE owner = :owner AND table_name = :tname
+        """,
+        owner=ORACLE_SCHEMA.upper(), tname=table_name,
+    )
+    identity_cols = cur.fetchall()
+    cur.close()
+    if not identity_cols:
+        return
+
+    qualified = _pg_qualified(table_name)
+    pgcur = pg_conn.cursor()
+    try:
+        for column_name, generation_type in identity_cols:
+            col = _pg_ident(column_name)
+            gen = "ALWAYS" if (generation_type or "").upper() == "ALWAYS" else "BY DEFAULT"
+
+            # Find the current max so the identity sequence resumes past migrated data.
+            pgcur.execute(f"SELECT COALESCE(MAX({col}), 0) FROM {qualified}")
+            current_max = pgcur.fetchone()[0] or 0
+
+            pgcur.execute(
+                f"ALTER TABLE {qualified} ALTER COLUMN {col} "
+                f"ADD GENERATED {gen} AS IDENTITY;"
+            )
+            pgcur.execute(
+                f"ALTER TABLE {qualified} ALTER COLUMN {col} "
+                f"RESTART WITH {int(current_max) + 1};"
+            )
+            print(f"  [ident]   {table_name}.{column_name}: GENERATED {gen} AS IDENTITY "
+                  f"(restart {int(current_max) + 1})")
+        pg_conn.commit()
+    except Exception:
+        pg_conn.rollback()
+        raise
+    finally:
+        pgcur.close()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 6. Orchestration — dump ➜ convert ➜ load ➜ constraints/identity per table; sequences + FKs around the loop
 
 # COMMAND ----------
 
@@ -734,6 +874,10 @@ def migrate_all_tables():
         results = {"ok": [], "failed": []}
         start_all = datetime.datetime.now()
 
+        # THIRD PASS (standalone sequences): create up front so they exist independently of tables.
+        migrate_sequences(ora_conn, pg_conn)
+        print("-" * 60)
+
         for idx, table_name in enumerate(table_names, start=1):
             print(f"\n[{idx}/{total}] {table_name}")
             t0 = datetime.datetime.now()
@@ -746,6 +890,8 @@ def migrate_all_tables():
                 load_postgres_sql(pg_conn, postgres_sql, table_name)
                 # SECOND PASS (per-table): PK / UNIQUE / CHECK / indexes
                 migrate_table_constraints(ora_conn, pg_conn, table_name)
+                # THIRD PASS (per-table): identity columns, after data is loaded
+                migrate_identity_columns(ora_conn, pg_conn, table_name)
 
                 if not KEEP_SQL_FILES:
                     os.remove(oracle_sql)
