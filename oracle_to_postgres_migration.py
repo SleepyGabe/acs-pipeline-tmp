@@ -70,7 +70,11 @@ WORK_DIR = "/dbfs/tmp/ora2pg"               # where the .sql dump files are writ
 ORACLE_DUMP_DIR = os.path.join(WORK_DIR, "oracle")
 POSTGRES_DUMP_DIR = os.path.join(WORK_DIR, "postgres")
 
-BATCH_SIZE = 5_000                          # rows fetched / inserted per batch
+BATCH_SIZE = 5_000                          # rows fetched per batch from Oracle
+MAX_PARALLEL_TABLES = 8                      # how many tables to migrate concurrently (thread pool).
+                                            # Each worker uses its own Oracle + Postgres connection,
+                                            # so keep this <= the connection limits on BOTH databases.
+                                            # Set to 1 for fully sequential migration.
 DROP_TARGET_BEFORE_LOAD = True              # DROP TABLE IF EXISTS on the Postgres side first
 CREATE_TARGET_TABLE = True                  # emit / run CREATE TABLE DDL on the Postgres side
 CONTINUE_ON_ERROR = True                    # keep migrating remaining tables if one fails
@@ -157,13 +161,17 @@ print(f"Postgres dump dir : {POSTGRES_DUMP_DIR}")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 3. STEP 1 — Dump an Oracle table (DDL + data) to an Oracle `.sql` file
+# MAGIC ## 3. STEP 1 — Dump an Oracle table to a DDL `.sql` file + a COPY-ready CSV
 # MAGIC
-# MAGIC We read the column metadata to build a `CREATE TABLE`, then stream the rows in batches
-# MAGIC and emit `INSERT` statements with Oracle-flavoured literals (e.g. `TO_TIMESTAMP(...)`).
+# MAGIC For speed, data is written as a **CSV** (Postgres `COPY` format) rather than per-row
+# MAGIC `INSERT`s — `COPY` is dramatically faster on large tables. The `CREATE TABLE` DDL is
+# MAGIC written to a separate `.sql` file (built from `all_tab_columns` for accurate Oracle types)
+# MAGIC and is the only thing the Step 2 converter has to touch. Values are formatted directly into
+# MAGIC Postgres-friendly text in Python, so the data needs no SQL-literal conversion at all.
 
 # COMMAND ----------
 
+import csv
 import datetime
 import decimal
 
@@ -173,103 +181,119 @@ def _oracle_quote_ident(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
-def _oracle_literal(value) -> str:
-    """Render a Python value as an Oracle SQL literal."""
-    if value is None:
-        return "NULL"
-    if isinstance(value, bool):
-        return "1" if value else "0"
-    if isinstance(value, (int, float, decimal.Decimal)):
-        return str(value)
-    if isinstance(value, datetime.datetime):
-        return "TO_TIMESTAMP('" + value.strftime("%Y-%m-%d %H:%M:%S.%f") + "', 'YYYY-MM-DD HH24:MI:SS.FF6')"
-    if isinstance(value, datetime.date):
-        return "TO_DATE('" + value.strftime("%Y-%m-%d") + "', 'YYYY-MM-DD')"
-    if isinstance(value, (bytes, bytearray)):
-        return "HEXTORAW('" + value.hex().upper() + "')"
-    # Default: string. Escape single quotes by doubling them.
-    return "'" + str(value).replace("'", "''") + "'"
+def _oracle_output_type_handler(cursor, name, default_type, size, precision, scale):
+    """
+    Fetch LOBs as plain values instead of locators: CLOB/NCLOB -> str, BLOB -> bytes.
+    This avoids a per-row round trip per LOB and is much faster for dumping.
+    """
+    if default_type in (oracledb.DB_TYPE_CLOB, oracledb.DB_TYPE_NCLOB):
+        return cursor.var(oracledb.DB_TYPE_LONG, arraysize=cursor.arraysize)
+    if default_type == oracledb.DB_TYPE_BLOB:
+        return cursor.var(oracledb.DB_TYPE_LONG_RAW, arraysize=cursor.arraysize)
+    return None
 
 
-def _oracle_type_from_cursor(col) -> str:
-    """Map a python-oracledb cursor description entry to an Oracle column type string."""
-    name, type_obj, display_size, internal_size, precision, scale, null_ok = col
-    tname = getattr(type_obj, "name", str(type_obj)).upper()
-
-    if "VARCHAR" in tname or tname in ("DB_TYPE_VARCHAR", "STRING"):
-        return f"VARCHAR2({internal_size or 4000})"
-    if "CHAR" in tname:
-        return f"CHAR({internal_size or 1})"
-    if "CLOB" in tname:
-        return "CLOB"
-    if "BLOB" in tname:
-        return "BLOB"
-    if "RAW" in tname:
-        return f"RAW({internal_size or 2000})"
-    if "TIMESTAMP" in tname:
-        return "TIMESTAMP"
-    if "DATE" in tname:
-        return "DATE"
-    if "NUMBER" in tname or "NUMERIC" in tname or "DECIMAL" in tname:
+def _oracle_column_type(data_type, length, precision, scale) -> str:
+    """Build an Oracle column type string from all_tab_columns metadata."""
+    dt = (data_type or "").upper()
+    if dt in ("VARCHAR2", "VARCHAR", "NVARCHAR2", "CHAR", "NCHAR"):
+        return f"{dt}({length or 4000})"
+    if dt == "NUMBER":
         if precision:
             return f"NUMBER({precision},{scale or 0})"
         return "NUMBER"
-    if "FLOAT" in tname or "DOUBLE" in tname or "BINARY_DOUBLE" in tname:
-        return "FLOAT"
-    if "INT" in tname:
-        return "NUMBER(38,0)"
+    if dt.startswith("TIMESTAMP"):
+        return dt  # preserve precision / WITH TIME ZONE, the converter normalises it
+    if dt in ("DATE", "CLOB", "NCLOB", "BLOB", "LONG", "FLOAT", "BINARY_FLOAT",
+              "BINARY_DOUBLE", "ROWID"):
+        return dt
+    if dt == "RAW":
+        return f"RAW({length or 2000})"
+    # Fallback for anything unusual.
     return "VARCHAR2(4000)"
 
 
-def dump_oracle_table(ora_conn, table_name: str) -> str:
+def _build_create_table_ddl(ora_conn, table_name: str) -> str:
+    """Build an Oracle CREATE TABLE statement from the data dictionary (accurate types)."""
+    cur = ora_conn.cursor()
+    cur.execute(
+        """
+        SELECT column_name, data_type, data_length, data_precision, data_scale, nullable
+        FROM all_tab_columns
+        WHERE owner = :owner AND table_name = :tname
+        ORDER BY column_id
+        """,
+        owner=ORACLE_SCHEMA.upper(), tname=table_name,
+    )
+    cols = cur.fetchall()
+    cur.close()
+    if not cols:
+        raise ValueError(f"No columns found for {ORACLE_SCHEMA}.{table_name}")
+
+    col_defs = []
+    for col_name, data_type, length, precision, scale, nullable in cols:
+        col_type = _oracle_column_type(data_type, length, precision, scale)
+        not_null = "" if nullable == "Y" else " NOT NULL"
+        col_defs.append(f"    {_oracle_quote_ident(col_name)} {col_type}{not_null}")
+
+    return (
+        f"-- Oracle DDL for {ORACLE_SCHEMA}.{table_name}\n"
+        f"CREATE TABLE {_oracle_quote_ident(table_name)} (\n"
+        + ",\n".join(col_defs)
+        + "\n);\n"
+    )
+
+
+def _csv_value(value):
+    """Format a Python value as Postgres COPY-CSV text. None -> '' (loaded as NULL)."""
+    if value is None:
+        return None  # csv.writer emits an empty field; COPY ... NULL '' reads it as NULL
+    if isinstance(value, datetime.datetime):
+        return value.strftime("%Y-%m-%d %H:%M:%S.%f")
+    if isinstance(value, datetime.date):
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, (bytes, bytearray)):
+        return "\\x" + value.hex()           # Postgres bytea hex input (literal in CSV mode)
+    if isinstance(value, bool):
+        return "t" if value else "f"
+    return value                              # int / float / Decimal / str — csv.writer stringifies
+
+
+def dump_oracle_table(ora_conn, table_name: str):
     """
-    STEP 1: Dump a single Oracle table (DDL + data) to an Oracle-flavoured .sql file.
-    Returns the path to the written file.
+    STEP 1: Dump a single Oracle table to (DDL .sql, data .csv).
+    Returns (ddl_path, csv_path). The CSV's first row is the column header.
     """
-    out_path = os.path.join(ORACLE_DUMP_DIR, f"{table_name}.sql")
+    ddl_path = os.path.join(ORACLE_DUMP_DIR, f"{table_name}.sql")
+    csv_path = os.path.join(ORACLE_DUMP_DIR, f"{table_name}.csv")
     qualified = f"{_oracle_quote_ident(ORACLE_SCHEMA)}.{_oracle_quote_ident(table_name)}"
 
+    # DDL from the dictionary (decoupled from the data cursor's LOB handler).
+    with open(ddl_path, "w", encoding="utf-8") as f:
+        f.write(_build_create_table_ddl(ora_conn, table_name))
+
+    # Data as COPY-ready CSV.
     cursor = ora_conn.cursor()
     cursor.arraysize = BATCH_SIZE
+    cursor.outputtypehandler = _oracle_output_type_handler
     cursor.execute(f"SELECT * FROM {qualified}")
+    col_names = [c[0] for c in cursor.description]
 
-    columns = cursor.description
-    col_names = [c[0] for c in columns]
-
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(f"-- Oracle dump of {ORACLE_SCHEMA}.{table_name}\n")
-        f.write(f"-- generated {datetime.datetime.utcnow().isoformat()}Z\n\n")
-
-        # --- DDL ---
-        f.write(f"CREATE TABLE {_oracle_quote_ident(table_name)} (\n")
-        col_defs = []
-        for col in columns:
-            col_name, _, _, _, _, _, null_ok = col
-            col_type = _oracle_type_from_cursor(col)
-            nullable = "" if null_ok else " NOT NULL"
-            col_defs.append(f"    {_oracle_quote_ident(col_name)} {col_type}{nullable}")
-        f.write(",\n".join(col_defs))
-        f.write("\n);\n\n")
-
-        # --- DATA ---
-        insert_prefix = (
-            f"INSERT INTO {_oracle_quote_ident(table_name)} "
-            f"({', '.join(_oracle_quote_ident(c) for c in col_names)}) VALUES "
-        )
-        row_count = 0
+    row_count = 0
+    with open(csv_path, "w", encoding="utf-8", newline="") as cf:
+        writer = csv.writer(cf, lineterminator="\n")
+        writer.writerow(col_names)                      # header row
         while True:
             rows = cursor.fetchmany(BATCH_SIZE)
             if not rows:
                 break
-            for row in rows:
-                literals = ", ".join(_oracle_literal(v) for v in row)
-                f.write(f"{insert_prefix}({literals});\n")
+            writer.writerows([_csv_value(v) for v in row] for row in rows)
             row_count += len(rows)
-        f.write(f"\nCOMMIT;\n")
-
     cursor.close()
-    print(f"  [dump]    {table_name}: {row_count} rows -> {out_path}")
-    return out_path
+
+    print(f"  [dump]    {table_name}: {row_count} rows -> {csv_path}")
+    return ddl_path, csv_path
+
 
 # COMMAND ----------
 
@@ -401,7 +425,10 @@ def convert_oracle_sql_text(oracle_sql_text: str) -> str:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 5. STEP 3 — Load the converted Postgres `.sql` file into Postgres
+# MAGIC ## 5. STEP 3 — Create the table from DDL, then bulk-load the CSV via `COPY`
+# MAGIC
+# MAGIC `COPY` is used instead of executing per-row `INSERT`s — it streams the whole CSV into
+# MAGIC Postgres in one operation and is typically 10–100× faster on large tables.
 
 # COMMAND ----------
 
@@ -437,32 +464,35 @@ def _split_sql_statements(sql_text: str):
     return [s for s in statements if s]
 
 
-def load_postgres_sql(pg_conn, postgres_sql_path: str, table_name: str):
+def load_postgres_copy(pg_conn, postgres_ddl_path: str, csv_path: str, table_name: str):
     """
-    STEP 3: Execute the converted Postgres .sql file against the target Postgres DB.
+    STEP 3: DROP/CREATE the target table from the converted DDL, then bulk-load the CSV
+    with COPY. The CSV's first line is a header giving the column order.
     """
-    with open(postgres_sql_path, "r", encoding="utf-8") as f:
-        sql_text = f.read()
-
     cur = pg_conn.cursor()
     qualified = f'"{PG_SCHEMA}"."{table_name}"'
     try:
         if DROP_TARGET_BEFORE_LOAD:
             cur.execute(f"DROP TABLE IF EXISTS {qualified} CASCADE;")
 
-        executed = 0
-        for stmt in _split_sql_statements(sql_text):
-            upper = stmt.lstrip().upper()
-            # Honour the create-table / commit flags.
-            if upper.startswith("CREATE TABLE") and not CREATE_TARGET_TABLE:
-                continue
-            if upper.startswith("COMMIT"):
-                continue  # we commit explicitly below
-            cur.execute(stmt)
-            executed += 1
+        if CREATE_TARGET_TABLE:
+            with open(postgres_ddl_path, "r", encoding="utf-8") as f:
+                for stmt in _split_sql_statements(f.read()):
+                    cur.execute(stmt)
+
+        # Bulk-load the data. Read the header to pin the column order, then COPY the rest.
+        with open(csv_path, "r", encoding="utf-8", newline="") as f:
+            header = next(csv.reader([f.readline()]))
+            col_list = ", ".join('"' + c.replace('"', '""') + '"' for c in header)
+            copy_sql = (
+                f"COPY {qualified} ({col_list}) "
+                f"FROM STDIN WITH (FORMAT csv, HEADER false, NULL '')"
+            )
+            cur.copy_expert(copy_sql, f)      # f is now positioned just after the header
+            row_count = cur.rowcount
 
         pg_conn.commit()
-        print(f"  [load]    {table_name}: executed {executed} statements")
+        print(f"  [load]    {table_name}: COPY {row_count} rows")
     except Exception:
         pg_conn.rollback()
         raise
@@ -981,9 +1011,21 @@ def resolve_load_order(ora_conn, table_names):
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 6. Orchestration — dump ➜ convert ➜ load ➜ constraints/identity per table; sequences + FKs around the loop
+# MAGIC ## 6. Orchestration — parallel fan-out (thread pool) with bracketing sequence/FK passes
+# MAGIC
+# MAGIC Tables are migrated concurrently with a thread pool of `MAX_PARALLEL_TABLES` workers. Each
+# MAGIC worker runs the full per-table pipeline (dump ➜ convert ➜ COPY ➜ constraints ➜ identity)
+# MAGIC on its **own** Oracle + Postgres connections — the drivers are not safe to share across
+# MAGIC threads. The work is I/O-bound (DB + file I/O releases the GIL), so threads give real
+# MAGIC concurrency and overlap Oracle reads with Postgres writes across different tables.
+# MAGIC
+# MAGIC Sequences run once **before** the pool; foreign keys run once **after** it (deferred-FK
+# MAGIC design), so load order is irrelevant to correctness and tables can finish in any order.
 
 # COMMAND ----------
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 
 def discover_oracle_tables(ora_conn):
     """Return all table names owned by ORACLE_SCHEMA."""
@@ -997,56 +1039,77 @@ def discover_oracle_tables(ora_conn):
     return names
 
 
-def migrate_all_tables():
-    """Run the full dump ➜ convert ➜ load pipeline for every table."""
+def migrate_one_table(table_name: str):
+    """
+    Full per-table pipeline on dedicated connections (safe to run in a worker thread).
+    Returns (table_name, ok: bool, error: str | None, seconds: float).
+    """
+    t0 = datetime.datetime.now()
     ora_conn = get_oracle_connection()
     pg_conn = get_postgres_connection()
+    try:
+        ddl_path, csv_path = dump_oracle_table(ora_conn, table_name)        # STEP 1
+        pg_ddl_path = convert_oracle_sql_to_postgres(ddl_path, table_name)  # STEP 2
+        load_postgres_copy(pg_conn, pg_ddl_path, csv_path, table_name)      # STEP 3
+        migrate_table_constraints(ora_conn, pg_conn, table_name)           # PK/UNIQUE/CHECK/index
+        migrate_identity_columns(ora_conn, pg_conn, table_name)            # identity columns
+
+        if not KEEP_SQL_FILES:
+            for p in (ddl_path, csv_path, pg_ddl_path):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+
+        elapsed = (datetime.datetime.now() - t0).total_seconds()
+        return (table_name, True, None, elapsed)
+    except Exception as exc:  # noqa: BLE001
+        elapsed = (datetime.datetime.now() - t0).total_seconds()
+        return (table_name, False, str(exc), elapsed)
+    finally:
+        ora_conn.close()
+        pg_conn.close()
+
+
+def migrate_all_tables():
+    """Run the full dump ➜ convert ➜ COPY pipeline for every table, in parallel."""
+    setup_ora = get_oracle_connection()
+    setup_pg = get_postgres_connection()
 
     try:
-        table_names = discover_oracle_tables(ora_conn) if DISCOVER_TABLES else list(TABLE_NAMES)
-        # Dependency-aware ordering: load FK parents before children.
-        table_names = resolve_load_order(ora_conn, table_names)
+        table_names = discover_oracle_tables(setup_ora) if DISCOVER_TABLES else list(TABLE_NAMES)
+        # Ordering is computed for logging/visibility; with parallel fan-out + deferred FKs it is
+        # not required for correctness (tables may finish in any order).
+        table_names = resolve_load_order(setup_ora, table_names)
         total = len(table_names)
-        print(f"Migrating {total} tables\n" + "=" * 60)
+        workers = max(1, int(MAX_PARALLEL_TABLES))
+        print(f"Migrating {total} tables with {workers} parallel worker(s)\n" + "=" * 60)
 
         results = {"ok": [], "failed": []}
         start_all = datetime.datetime.now()
 
-        # THIRD PASS (standalone sequences): create up front so they exist independently of tables.
-        migrate_sequences(ora_conn, pg_conn)
+        # Standalone sequences: create up front, before the table workers start.
+        migrate_sequences(setup_ora, setup_pg)
         print("-" * 60)
 
-        for idx, table_name in enumerate(table_names, start=1):
-            print(f"\n[{idx}/{total}] {table_name}")
-            t0 = datetime.datetime.now()
-            try:
-                # STEP 1: dump from Oracle
-                oracle_sql = dump_oracle_table(ora_conn, table_name)
-                # STEP 2: convert Oracle SQL -> Postgres SQL
-                postgres_sql = convert_oracle_sql_to_postgres(oracle_sql, table_name)
-                # STEP 3: load into Postgres
-                load_postgres_sql(pg_conn, postgres_sql, table_name)
-                # SECOND PASS (per-table): PK / UNIQUE / CHECK / indexes
-                migrate_table_constraints(ora_conn, pg_conn, table_name)
-                # THIRD PASS (per-table): identity columns, after data is loaded
-                migrate_identity_columns(ora_conn, pg_conn, table_name)
-
-                if not KEEP_SQL_FILES:
-                    os.remove(oracle_sql)
-                    os.remove(postgres_sql)
-
-                elapsed = (datetime.datetime.now() - t0).total_seconds()
-                print(f"  [done]    {table_name} in {elapsed:.1f}s")
-                results["ok"].append(table_name)
-            except Exception as exc:  # noqa: BLE001
-                print(f"  [ERROR]   {table_name}: {exc}")
-                results["failed"].append((table_name, str(exc)))
-                if not CONTINUE_ON_ERROR:
-                    raise
+        # Parallel fan-out: each table is migrated end-to-end on its own connections.
+        done = 0
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(migrate_one_table, t): t for t in table_names}
+            for fut in as_completed(futures):
+                table_name, ok, err, elapsed = fut.result()
+                done += 1
+                if ok:
+                    print(f"[{done}/{total}] [done]  {table_name} in {elapsed:.1f}s")
+                    results["ok"].append(table_name)
+                else:
+                    print(f"[{done}/{total}] [ERROR] {table_name}: {err}")
+                    results["failed"].append((table_name, err))
 
         # FINAL PASS: foreign keys, once every table + its data exists.
         print("\n" + "-" * 60)
-        migrate_foreign_keys(ora_conn, pg_conn, [t for t in table_names if t in results["ok"]])
+        ok_in_order = [t for t in table_names if t in set(results["ok"])]
+        migrate_foreign_keys(setup_ora, setup_pg, ok_in_order)
 
         total_elapsed = (datetime.datetime.now() - start_all).total_seconds()
         print("\n" + "=" * 60)
@@ -1056,10 +1119,12 @@ def migrate_all_tables():
             print("\nFailed tables:")
             for name, err in results["failed"]:
                 print(f"  - {name}: {err}")
+            if not CONTINUE_ON_ERROR:
+                raise RuntimeError(f"{len(results['failed'])} table(s) failed to migrate")
         return results
     finally:
-        ora_conn.close()
-        pg_conn.close()
+        setup_ora.close()
+        setup_pg.close()
 
 # COMMAND ----------
 

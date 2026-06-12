@@ -123,8 +123,8 @@ def main():
     print(f"Loading notebook functions from: {NOTEBOOK}")
     ns = load_notebook_namespace(overrides)
 
-    expected_fns = ["migrate_all_tables", "dump_oracle_table",
-                    "convert_oracle_sql_to_postgres", "load_postgres_sql",
+    expected_fns = ["migrate_all_tables", "migrate_one_table", "dump_oracle_table",
+                    "convert_oracle_sql_to_postgres", "load_postgres_copy",
                     "get_oracle_connection", "get_postgres_connection"]
     missing = [fn for fn in expected_fns if fn not in ns or not callable(ns[fn])]
     if missing:
