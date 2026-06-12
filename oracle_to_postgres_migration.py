@@ -604,6 +604,13 @@ DISCOVER_TABLES = False
 import oracledb
 import psycopg2
 
+# Fetch every Oracle NUMBER as an exact decimal.Decimal instead of a Python float.
+# oracledb defaults NUMBER -> float, which loses precision: a NUMBER(38,38) value
+# comes back rounded (e.g. to -1.0), which then OVERFLOWS the target NUMERIC(38,38)
+# and aborts the whole-table COPY ("numeric field overflow"). Decimal preserves the
+# full precision/scale, and _csv_value stringifies Decimal losslessly.
+oracledb.defaults.fetch_decimals = True
+
 
 def get_oracle_connection():
     """Open a connection to the source Oracle database (python-oracledb thin mode)."""
@@ -613,7 +620,16 @@ def get_oracle_connection():
         dsn = oracledb.makedsn(ORACLE_HOST, ORACLE_PORT, sid=ORACLE_SID)
     else:
         raise ValueError("Either ORACLE_SERVICE_NAME or ORACLE_SID must be set.")
-    return oracledb.connect(user=ORACLE_USER, password=ORACLE_PASSWORD, dsn=dsn)
+    conn = oracledb.connect(user=ORACLE_USER, password=ORACLE_PASSWORD, dsn=dsn)
+    # NOTE: we deliberately do NOT pin the session time zone. On oracledb thin mode
+    # the dump is session-TZ-independent: TIMESTAMP WITH LOCAL TIME ZONE fetches the
+    # stored UTC instant (naive), and plain TIMESTAMP / DATE are unaffected — verified
+    # byte-identical with and without a session-TZ pin. (TIMESTAMP WITH TIME ZONE loses
+    # its stored offset at fetch regardless of session zone — a documented driver
+    # limitation; see run_adversarial_test.py.) An ALTER SESSION here would be an inert
+    # no-op and the only connection-setup statement that could fail (ORA-01031) under a
+    # PDB lockdown profile, so we omit it.
+    return conn
 
 
 def get_postgres_connection():
@@ -652,6 +668,46 @@ import datetime
 import decimal
 
 
+import hashlib
+
+
+def _short_ident(name: str) -> str:
+    """
+    Shorten an identifier that would exceed Postgres' 63-byte limit, deterministically.
+
+    Postgres SILENTLY truncates any identifier longer than 63 bytes (NAMEDATALEN-1).
+    Two long Oracle names that share their first 63 bytes would collide on the
+    Postgres side (DuplicateColumn / DuplicateObject), and a column name truncated in
+    CREATE TABLE but referenced un-truncated elsewhere would mismatch. To stay
+    consistent we apply ONE canonical shortener everywhere a name is emitted INTO
+    Postgres (column names in CREATE TABLE, the COPY column list, constraint / index /
+    FK names, and column lists inside constraints).
+
+    Strategy: if the name already fits in 63 bytes, return it UNCHANGED (so every
+    real-world <63-char identifier — including the existing test fixtures — is
+    untouched). Otherwise keep the first 57 bytes and append '_' + a 5-hex-char digest
+    of the FULL original name (total <= 63 bytes), which is stable for a given input
+    and distinguishes names that share a long common prefix.
+
+    This is applied ONLY to the Postgres-side identifier. The Oracle-side dictionary
+    queries keep the real Oracle identifiers (they must, to read the source).
+    """
+    encoded = name.encode("utf-8")
+    if len(encoded) <= 63:
+        return name
+    digest = hashlib.blake2b(encoded, digest_size=8).hexdigest()[:5]
+    # Truncate the prefix on a byte boundary, then back off if we split a multibyte
+    # char, so the result is always valid UTF-8 and <= 63 bytes.
+    prefix = encoded[:57]
+    while True:
+        try:
+            prefix_str = prefix.decode("utf-8")
+            break
+        except UnicodeDecodeError:
+            prefix = prefix[:-1]
+    return f"{prefix_str}_{digest}"
+
+
 def _oracle_quote_ident(name: str) -> str:
     """Quote an Oracle identifier."""
     return '"' + name.replace('"', '""') + '"'
@@ -669,19 +725,53 @@ def _oracle_output_type_handler(cursor, name, default_type, size, precision, sca
     return None
 
 
-def _oracle_column_type(data_type, length, precision, scale) -> str:
-    """Build an Oracle column type string from all_tab_columns metadata."""
+def _oracle_column_type(data_type, length, precision, scale, char_length=None) -> str:
+    """Build an Oracle column type string from all_tab_columns metadata.
+
+    ``char_length`` is the column's length in *characters* (all_tab_columns.char_length).
+    For character types it is preferred over ``length`` (data_length, in BYTES): on an
+    AL32UTF8 database a ``VARCHAR2(100 CHAR)`` column reports data_length=400 but
+    char_length=100, so using data_length would quadruple the declared size. For
+    byte-semantics columns char_length equals the declared length, so preferring it
+    when present is correct in both cases. Falls back to ``length`` if char_length is
+    0/NULL. RAW deliberately keeps using ``length`` (it is genuinely byte-sized).
+    """
     dt = (data_type or "").upper()
     if dt in ("VARCHAR2", "VARCHAR", "NVARCHAR2", "CHAR", "NCHAR"):
-        return f"{dt}({length or 4000})"
+        char_len = char_length if (char_length and int(char_length) > 0) else length
+        return f"{dt}({char_len or 4000})"
     if dt == "NUMBER":
+        # Oracle NUMBER scale can be negative (rounding to the left of the decimal
+        # point) or the sentinel -127 (the "floating NUMBER" subtype with binary
+        # precision and no fixed scale). Postgres NUMERIC rejects a negative scale,
+        # so we never emit one.
+        if scale is not None and int(scale) == -127:
+            # Floating NUMBER subtype: emit bare NUMBER -> unbounded NUMERIC, which
+            # preserves all digits rather than picking an arbitrary fixed scale.
+            return "NUMBER"
+        if scale is not None and int(scale) < 0:
+            # Real negative scale (e.g. NUMBER(5,-2)): Postgres can't store negative
+            # scale. Drop to scale 0 (Oracle's left-of-point rounding is a storage
+            # detail, not representable in NUMERIC's typemod). Bare NUMBER if no
+            # precision is known.
+            return f"NUMBER({precision})" if precision else "NUMBER"
         if precision:
-            return f"NUMBER({precision},{scale or 0})"
+            return f"NUMBER({precision},{int(scale or 0)})"
+        if scale is not None and int(scale) >= 0:
+            # NUMBER(*,s): precision is NULL but a scale is declared. Use Oracle's
+            # maximum precision (38) so the scale is preserved.
+            return f"NUMBER(38,{int(scale)})"
         return "NUMBER"
     if dt.startswith("TIMESTAMP"):
         return dt  # preserve precision / WITH TIME ZONE, the converter normalises it
+    if dt in ("ROWID", "UROWID"):
+        # Oracle physical/logical row addresses. Postgres has no equivalent type
+        # (and "rowid" is not a real Postgres type), so the dumped value is just
+        # an opaque string. Map to TEXT; the _TYPE_RULES ROWID/UROWID->TEXT rules
+        # are a belt-and-suspenders for any other code path.
+        return "TEXT"
     if dt in ("DATE", "CLOB", "NCLOB", "BLOB", "LONG", "FLOAT", "BINARY_FLOAT",
-              "BINARY_DOUBLE", "ROWID"):
+              "BINARY_DOUBLE"):
         return dt
     if dt == "RAW":
         return f"RAW({length or 2000})"
@@ -703,12 +793,19 @@ def _build_create_table_ddl(ora_conn, table_name: str) -> str:
     )
     identity_cols = {r[0] for r in cur.fetchall()}
 
+    # Use ALL_TAB_COLS (not ALL_TAB_COLUMNS): only ALL_TAB_COLS exposes
+    # VIRTUAL_COLUMN / HIDDEN_COLUMN. We filter hidden_column='NO' so the result
+    # matches what ALL_TAB_COLUMNS / the data dump's SELECT * actually return
+    # (ALL_TAB_COLS additionally lists system-generated hidden columns — e.g. the
+    # backing column of a function-based index — which must NOT appear in CREATE
+    # TABLE or the COPY column list would misalign).
     cur.execute(
         """
         SELECT column_name, data_type, data_length, data_precision, data_scale,
-               nullable, data_default
-        FROM all_tab_columns
+               nullable, data_default, char_length, virtual_column
+        FROM all_tab_cols
         WHERE owner = :owner AND table_name = :tname
+          AND hidden_column = 'NO'
         ORDER BY column_id
         """,
         owner=owner, tname=table_name,
@@ -719,25 +816,45 @@ def _build_create_table_ddl(ora_conn, table_name: str) -> str:
         raise ValueError(f"No columns found for {ORACLE_SCHEMA}.{table_name}")
 
     col_defs = []
-    for col_name, data_type, length, precision, scale, nullable, data_default in cols:
-        col_type = _oracle_column_type(data_type, length, precision, scale)
+    for (col_name, data_type, length, precision, scale, nullable, data_default,
+         char_length, virtual_column) in cols:
+        col_type = _oracle_column_type(data_type, length, precision, scale, char_length)
         not_null = "" if nullable == "Y" else " NOT NULL"
 
+        is_virtual = (virtual_column or "").upper() == "YES"
+
         default_clause = ""
-        if col_name not in identity_cols and data_default is not None:
+        if is_virtual:
+            # Oracle virtual (generated) columns carry a data_default that is an
+            # EXPRESSION referencing OTHER columns (e.g. "QTY"*"PRICE"). Postgres
+            # forbids column references in a plain DEFAULT, so emitting it would make
+            # CREATE TABLE fail — and since DROP ... CASCADE already ran, the table
+            # would be LOST. We also cannot emit a Postgres GENERATED ... STORED
+            # column: the data dump does SELECT * (which already includes the
+            # column's computed values) and COPY cannot write into a GENERATED
+            # column, which would break the load. So we materialise it as a PLAIN
+            # column holding the Oracle-computed snapshot, with no DEFAULT.
+            print(f"  [virtual] {table_name}.{col_name}: Oracle virtual column "
+                  f"materialised as a plain column (snapshot of values, no longer "
+                  f"auto-computed).")
+        elif col_name not in identity_cols and data_default is not None:
             # data_default is Oracle source text (LONG); trim and convert the
             # expression (SYSTIMESTAMP -> CURRENT_TIMESTAMP, NVL -> COALESCE, ...).
             raw_default = str(data_default).strip()
             if raw_default and raw_default.upper() != "NULL":
                 default_clause = f" DEFAULT {convert_oracle_sql_text(raw_default).strip()}"
 
+        # Emit the Postgres-side (possibly shortened) column name so it MATCHES the
+        # COPY column list and the constraint/index column lists, all of which also
+        # go through _short_ident. (No-op for names <= 63 bytes.)
         col_defs.append(
-            f"    {_oracle_quote_ident(col_name)} {col_type}{default_clause}{not_null}"
+            f"    {_oracle_quote_ident(_short_ident(col_name))} "
+            f"{col_type}{default_clause}{not_null}"
         )
 
     return (
         f"-- Oracle DDL for {ORACLE_SCHEMA}.{table_name}\n"
-        f"CREATE TABLE {_oracle_quote_ident(table_name)} (\n"
+        f"CREATE TABLE {_oracle_quote_ident(_short_ident(table_name))} (\n"
         + ",\n".join(col_defs)
         + "\n);\n"
     )
@@ -751,17 +868,35 @@ def _csv_value(value):
         value = value.read()          # CLOB -> str, BLOB -> bytes; then fall through
         return _csv_value(value)
     if isinstance(value, datetime.datetime):
+        # Build the year/month/day explicitly: glibc strftime does NOT zero-pad
+        # years < 1000 ("%Y" on year 1 -> "1"), and Postgres then reads "1-01-01"
+        # as year 2001 (its 2-digit-year heuristic) -> SILENT corruption. Format
+        # the year as 4 digits ourselves so years 1..999 round-trip exactly.
+        base = (f"{value.year:04d}-{value.month:02d}-{value.day:02d} "
+                f"{value.hour:02d}:{value.minute:02d}:{value.second:02d}"
+                f".{value.microsecond:06d}")
         if value.tzinfo is not None:
             # Preserve the UTC offset for TIMESTAMP WITH (LOCAL) TIME ZONE columns.
-            return value.strftime("%Y-%m-%d %H:%M:%S.%f%z")
-        return value.strftime("%Y-%m-%d %H:%M:%S.%f")
+            return base + value.strftime("%z")
+        return base
     if isinstance(value, datetime.date):
-        return value.strftime("%Y-%m-%d")
+        # Same year zero-pad fix as above (date has no time component).
+        return f"{value.year:04d}-{value.month:02d}-{value.day:02d}"
     if isinstance(value, (bytes, bytearray)):
         return "\\x" + value.hex()           # Postgres bytea hex input (literal in CSV mode)
     if isinstance(value, bool):
         return "t" if value else "f"
-    return value                              # int / float / Decimal / str — csv.writer stringifies
+    if isinstance(value, str):
+        # Postgres text/varchar CANNOT store a NUL byte (\x00); a CHR(0) inside a
+        # CLOB/VARCHAR2 value aborts the whole-table COPY with
+        # "invalid byte sequence for encoding ... 0x00". Oracle does allow embedded
+        # NULs in text, so strip them here (silently — a per-row warning would be
+        # far too noisy on large tables). This also covers CLOB values, which reach
+        # here as str after the LOB .read() branch above recurses.
+        if "\x00" in value:
+            value = value.replace("\x00", "")
+        return value
+    return value                              # int / float / Decimal — csv.writer stringifies
 
 
 def dump_oracle_table(ora_conn, table_name: str):
@@ -835,6 +970,10 @@ _TYPE_RULES = [
     (re.compile(r"\bBLOB\b", re.IGNORECASE), "BYTEA"),
     (re.compile(r"\bLONG\s+RAW\b", re.IGNORECASE), "BYTEA"),
     (re.compile(r"\bRAW\s*\(\s*\d+\s*\)", re.IGNORECASE), "BYTEA"),
+    # ROWID / UROWID have no Postgres type (a bare "rowid" would fail with
+    # 'type "rowid" does not exist'). The dumped value is an opaque string.
+    (re.compile(r"\bUROWID\b", re.IGNORECASE), "TEXT"),
+    (re.compile(r"\bROWID\b", re.IGNORECASE), "TEXT"),
     (re.compile(r"\bLONG\b", re.IGNORECASE), "TEXT"),
     # NUMBER(p,0) -> integer-ish, NUMBER(p,s) -> NUMERIC(p,s), bare NUMBER -> NUMERIC
     (re.compile(r"\bNUMBER\s*\(\s*(\d+)\s*,\s*0\s*\)", re.IGNORECASE), r"NUMERIC(\1)"),
@@ -849,18 +988,33 @@ _TYPE_RULES = [
     (re.compile(r"\bDATE\b", re.IGNORECASE), "TIMESTAMP"),
 ]
 
-# Function / expression rewrites (applied to data + DDL).
-_FUNC_RULES = [
+# HEXTORAW('AABB') -> '\xAABB'  (Postgres bytea hex literal). This one spans
+# code + a quoted argument, so it is applied to the FULL line (see _convert_line),
+# NOT inside _apply_rules_outside_literals.
+_HEXTORAW_RE = re.compile(r"HEXTORAW\s*\(\s*'([0-9A-Fa-f]*)'\s*\)")
+
+# Function / expression rewrites applied ONLY to code OUTSIDE string literals and
+# quoted identifiers (so a literal 'SYSDATE' / 'FROM DUAL' is never corrupted).
+# HEXTORAW is intentionally excluded here — it is handled on the full line.
+_FUNC_RULES_NOLIT = [
     (re.compile(r"\bSYSDATE\b", re.IGNORECASE), "CURRENT_TIMESTAMP"),
     (re.compile(r"\bSYSTIMESTAMP\b", re.IGNORECASE), "CURRENT_TIMESTAMP"),
     (re.compile(r"\bNVL\s*\(", re.IGNORECASE), "COALESCE("),
     (re.compile(r"\bSYS_GUID\s*\(\s*\)", re.IGNORECASE), "gen_random_uuid()"),
+    # Oracle INSTR(str, sub) and Postgres strpos(str, sub) share the SAME argument
+    # order and both return the 1-based position (0 if not found), so the common
+    # 2-arg form converts faithfully. The 3-/4-arg Oracle form (start position /
+    # occurrence) has no direct strpos equivalent and will still fail ADD
+    # CONSTRAINT — but it is now caught by the per-statement isolation in
+    # migrate_table_constraints, so it only drops that one CHECK, never the PK.
+    (re.compile(r"\bINSTR\s*\(", re.IGNORECASE), "strpos("),
     # Oracle string concat is the same (||) so nothing to do there.
     # FROM DUAL is meaningless in Postgres.
     (re.compile(r"\bFROM\s+DUAL\b", re.IGNORECASE), ""),
-    # HEXTORAW('AABB') -> '\xAABB'  (Postgres bytea hex literal)
-    (re.compile(r"HEXTORAW\s*\(\s*'([0-9A-Fa-f]*)'\s*\)"), r"'\\x\1'"),
 ]
+
+# Back-compat alias: the full set of function rules (used to be applied whole-line).
+_FUNC_RULES = _FUNC_RULES_NOLIT + [(_HEXTORAW_RE, r"'\\x\1'")]
 
 # TO_DATE / TO_TIMESTAMP with the formats we emit in step 1 -> Postgres casts.
 _TO_TIMESTAMP_RE = re.compile(
@@ -871,20 +1025,55 @@ _TO_DATE_RE = re.compile(
 )
 
 
+# Splits a line into alternating (code, literal) regions so the function/type
+# rules never rewrite text *inside* a single-quoted string literal ('' escaping)
+# or a double-quoted identifier ("" escaping). Each match is one whole literal /
+# identifier region; everything between matches is "code" we are free to rewrite.
+_LITERAL_REGION_RE = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"")
+
+
+def _apply_rules_outside_literals(line: str, rules) -> str:
+    """Apply (pattern, repl) rules only to the parts of ``line`` that are NOT
+    inside a single-quoted string literal or double-quoted identifier."""
+    out = []
+    pos = 0
+    for m in _LITERAL_REGION_RE.finditer(line):
+        code = line[pos:m.start()]
+        for pattern, repl in rules:
+            code = pattern.sub(repl, code)
+        out.append(code)
+        out.append(m.group(0))  # literal / identifier region: verbatim
+        pos = m.end()
+    tail = line[pos:]
+    for pattern, repl in rules:
+        tail = pattern.sub(repl, tail)
+    out.append(tail)
+    return "".join(out)
+
+
 def _convert_line(line: str, in_ddl: bool) -> str:
-    """Apply the conversion rules to a single line of SQL."""
-    # Date/time literal conversions first (they contain quoted strings).
+    """Apply the conversion rules to a single line of SQL.
+
+    Order is deliberate:
+      1. TO_DATE / TO_TIMESTAMP / HEXTORAW run on the FULL line first. Each of
+         these matches a function call whose quoted argument is *part of the
+         match* (e.g. ``TO_DATE('2024-01-01','YYYY-MM-DD')``), so they must see
+         the whole token — splitting on literals would break them.
+      2. The remaining function rules (SYSDATE, NVL, FROM DUAL, ...) and, in DDL,
+         the type rules, run ONLY on the code regions outside string literals /
+         quoted identifiers. This stops a literal like the DEFAULT ``'SYSDATE'``
+         or a CHECK value ``'FROM DUAL'`` from being silently rewritten.
+    """
+    # 1. Date/time + HEXTORAW conversions: consume their own quoted args by design.
     line = _TO_TIMESTAMP_RE.sub(r"TIMESTAMP '\1'", line)
     line = _TO_DATE_RE.sub(r"DATE '\1'", line)
+    line = _HEXTORAW_RE.sub(r"'\\x\1'", line)
 
-    # Function / expression rewrites.
-    for pattern, repl in _FUNC_RULES:
-        line = pattern.sub(repl, line)
-
-    # Data-type rewrites only matter inside DDL.
+    # 2. Function rewrites + (DDL-only) type rewrites, literal-aware.
+    rules = list(_FUNC_RULES_NOLIT)
     if in_ddl:
-        for pattern, repl in _TYPE_RULES:
-            line = pattern.sub(repl, line)
+        rules += _TYPE_RULES
+    line = _apply_rules_outside_literals(line, rules)
 
     return line
 
@@ -911,7 +1100,14 @@ def convert_oracle_sql_to_postgres(oracle_sql_path: str, table_name: str) -> str
             if stripped.startswith("CREATE TABLE"):
                 in_ddl = True
             line = _convert_line(line, in_ddl)
-            if in_ddl and ");" in line:
+            # End the CREATE TABLE block only when the closing ");" appears OUTSIDE
+            # any string literal / quoted identifier. A naive `");" in line` check
+            # mis-fires on a column DEFAULT whose literal contains ");" (e.g.
+            # DEFAULT 'x);y'), flipping in_ddl off mid-table so every later column
+            # skips the type rules and emits NUMBER/DATE verbatim -> CREATE fails ->
+            # table lost. Mask quoted regions first (same regex the rule engine uses)
+            # so only the structural closing paren can end the block.
+            if in_ddl and ");" in _LITERAL_REGION_RE.sub("", line):
                 in_ddl = False
 
             # Oracle uses "" for quoting; Postgres uses "" too, so identifiers pass through.
@@ -1041,7 +1237,9 @@ def load_postgres_copy(pg_conn, postgres_ddl_path: str, csv_path: str, table_nam
     The CSV's first line is a header giving the column order.
     """
     cur = pg_conn.cursor()
-    qualified = f'"{PG_SCHEMA}"."{table_name}"'
+    # _pg_qualified applies _short_ident, so the DROP/COPY target name matches the
+    # (possibly shortened) name CREATE TABLE emitted. No-op for names <= 63 bytes.
+    qualified = _pg_qualified(table_name)
     try:
         if LOAD_MODE == "recreate":
             cur.execute(f"DROP TABLE IF EXISTS {qualified} CASCADE;")
@@ -1058,10 +1256,20 @@ def load_postgres_copy(pg_conn, postgres_ddl_path: str, csv_path: str, table_nam
             if LOAD_MODE == "truncate":
                 cur.execute(f"TRUNCATE TABLE {qualified};")
 
-            col_list = ", ".join('"' + c.replace('"', '""') + '"' for c in header)
+            # Shorten each header (real Oracle) column name the same way CREATE TABLE
+            # did, so the COPY column list matches the emitted column names.
+            col_list = ", ".join(_pg_ident(c) for c in header)
+            # FORCE_NULL on every loaded column so a *quoted* empty field ("") is
+            # also read as NULL, not as an empty string. csv.writer emits a lone
+            # empty field on a single-column row as a quoted "" (to avoid writing a
+            # blank line); plain `NULL ''` only matches the UNQUOTED empty token, so
+            # without FORCE_NULL a single-column NULL would silently load as ''.
+            # This is semantically correct for Oracle-sourced data: Oracle treats ''
+            # as NULL, so there is never a genuine empty string to preserve.
             copy_sql = (
                 f"COPY {qualified} ({col_list}) "
-                f"FROM STDIN WITH (FORMAT csv, HEADER false, NULL '')"
+                f"FROM STDIN WITH (FORMAT csv, HEADER false, NULL '', "
+                f"FORCE_NULL ({col_list}))"
             )
             cur.copy_expert(copy_sql, f)      # f is now positioned just after the header
             row_count = cur.rowcount
@@ -1092,8 +1300,12 @@ def load_postgres_copy(pg_conn, postgres_ddl_path: str, csv_path: str, table_nam
 # COMMAND ----------
 
 def _pg_ident(name: str) -> str:
-    """Quote an identifier for Postgres."""
-    return '"' + name.replace('"', '""') + '"'
+    """Quote an identifier for Postgres, shortening it if it exceeds 63 bytes.
+
+    `_short_ident` is a no-op for any name that already fits in 63 bytes, so this
+    is transparent for normal identifiers and only kicks in for over-long ones —
+    keeping the emitted name consistent with CREATE TABLE / COPY / constraints."""
+    return '"' + _short_ident(name).replace('"', '""') + '"'
 
 
 def _pg_qualified(table_name: str) -> str:
@@ -1101,11 +1313,15 @@ def _pg_qualified(table_name: str) -> str:
 
 
 def _pg_column_type(pg_cur, table_name: str, column_name: str):
-    """Return the Postgres data_type for a column, or None if it doesn't exist."""
+    """Return the Postgres data_type for a column, or None if it doesn't exist.
+
+    The table/column may have been shortened on the Postgres side (see
+    _short_ident), so we look up by the shortened name to find the real row.
+    No-op for names <= 63 bytes."""
     pg_cur.execute(
         "SELECT data_type FROM information_schema.columns "
         "WHERE table_schema = %s AND table_name = %s AND column_name = %s",
-        (PG_SCHEMA, table_name, column_name),
+        (PG_SCHEMA, _short_ident(table_name), _short_ident(column_name)),
     )
     row = pg_cur.fetchone()
     return row[0] if row else None
@@ -1150,7 +1366,16 @@ def _quote_check_condition(cond: str, columns) -> str:
         if tok[0] in ('"', "'"):  # quoted identifier or string literal
             return tok
         if tok.upper() in colset:
-            return '"' + tok.upper() + '"'
+            # Don't quote a token that is actually a function call, i.e. the next
+            # non-whitespace char after the match is '('. e.g. in LENGTH(NAME)>0,
+            # LENGTH happens to share a name with a column but is a function here.
+            # A real column operand like ``ACTIVE IN (...)`` has ``IN`` (not '(')
+            # as its next non-whitespace token, so it is still quoted.
+            if cond[m.end():].lstrip()[:1] == "(":
+                return tok
+            # Shorten so the reference matches a column that CREATE TABLE shortened.
+            # No-op for names <= 63 bytes.
+            return '"' + _short_ident(tok.upper()) + '"'
         return tok
 
     return _CHECK_TOKEN_RE.sub(repl, cond)
@@ -1179,7 +1404,9 @@ def build_oracle_constraint_ddl(ora_conn, table_name: str):
     Oracle-flavoured DDL (str). Foreign keys are intentionally excluded here.
     """
     owner = ORACLE_SCHEMA.upper()
-    qualified = f'"{table_name}"'
+    # Emit the Postgres-side (possibly shortened) table name so it matches the
+    # CREATE TABLE / COPY target. No-op for names <= 63 bytes.
+    qualified = f'"{_short_ident(table_name)}"'
     lines = [f"-- constraints & indexes for {table_name}"]
     table_cols = _table_columns(ora_conn, owner, table_name)
 
@@ -1204,9 +1431,10 @@ def build_oracle_constraint_ddl(ora_conn, table_name: str):
                 if not cols:
                     continue
                 kind = "PRIMARY KEY" if ctype == "P" else "UNIQUE"
-                col_list = ", ".join(f'"{c}"' for c in cols)
+                col_list = ", ".join(f'"{_short_ident(c)}"' for c in cols)
                 lines.append(
-                    f'ALTER TABLE {qualified} ADD CONSTRAINT "{cname}" {kind} ({col_list});'
+                    f'ALTER TABLE {qualified} ADD CONSTRAINT '
+                    f'"{_short_ident(cname)}" {kind} ({col_list});'
                 )
             elif ctype == "C":
                 cond = (search_cond or "").strip()
@@ -1215,17 +1443,22 @@ def build_oracle_constraint_ddl(ora_conn, table_name: str):
                     continue
                 cond = _quote_check_condition(cond, table_cols)
                 lines.append(
-                    f'ALTER TABLE {qualified} ADD CONSTRAINT "{cname}" CHECK ({cond});'
+                    f'ALTER TABLE {qualified} ADD CONSTRAINT '
+                    f'"{_short_ident(cname)}" CHECK ({cond});'
                 )
 
     # --- Indexes (excluding those backing PK / UNIQUE constraints) ---
+    # Include both plain ('NORMAL') and function-based / descending indexes
+    # ('FUNCTION-BASED NORMAL'). Oracle stores BOTH (col DESC) and (UPPER(col))
+    # as FUNCTION-BASED NORMAL; Postgres supports descending AND expression
+    # indexes, so emitting them recovers fidelity that was previously dropped.
     if MIGRATE_INDEXES:
         cur.execute(
             """
             SELECT index_name, uniqueness
             FROM all_indexes
             WHERE table_owner = :owner AND table_name = :tname
-              AND index_type = 'NORMAL'
+              AND index_type IN ('NORMAL', 'FUNCTION-BASED NORMAL')
               AND index_name NOT IN (
                   SELECT constraint_name FROM all_constraints
                   WHERE owner = :owner AND table_name = :tname
@@ -1238,23 +1471,45 @@ def build_oracle_constraint_ddl(ora_conn, table_name: str):
         index_rows = cur.fetchall()
         for index_name, uniqueness in index_rows:
             icur = ora_conn.cursor()
+            # Pull each key column with its sort direction AND, for function-based
+            # indexes, the expression text (a LONG in all_ind_expressions). Plain
+            # (col DESC) indexes are also function-based: Oracle stores them with
+            # column_expression='"COL"' and descend='DESC', so the expression path
+            # handles DESC naturally.
             icur.execute(
                 """
-                SELECT column_name
-                FROM all_ind_columns
-                WHERE index_owner = :owner AND index_name = :iname
-                ORDER BY column_position
+                SELECT ic.column_name, ic.descend, ie.column_expression
+                FROM all_ind_columns ic
+                LEFT JOIN all_ind_expressions ie
+                  ON ie.index_owner = ic.index_owner
+                 AND ie.index_name  = ic.index_name
+                 AND ie.column_position = ic.column_position
+                WHERE ic.index_owner = :owner AND ic.index_name = :iname
+                ORDER BY ic.column_position
                 """,
                 owner=owner, iname=index_name,
             )
-            icols = [r[0] for r in icur.fetchall()]
+            keys = []
+            for col_name, descend, col_expr in icur.fetchall():
+                if col_expr is not None:
+                    # Expression text references already-quoted Oracle column
+                    # names (e.g. UPPER("NAME")). Convert it so function rules +
+                    # literal-awareness apply. >63-char columns inside the
+                    # expression are an edge-of-edge, left as-is.
+                    key = convert_oracle_sql_text(str(col_expr)).strip()
+                else:
+                    key = f'"{_short_ident(col_name)}"'
+                if (descend or "").upper() == "DESC":
+                    key += " DESC"
+                keys.append(key)
             icur.close()
-            if not icols:
+            if not keys:
                 continue
             unique = "UNIQUE " if uniqueness == "UNIQUE" else ""
-            col_list = ", ".join(f'"{c}"' for c in icols)
+            col_list = ", ".join(keys)
             lines.append(
-                f'CREATE {unique}INDEX "{index_name}" ON {qualified} ({col_list});'
+                f'CREATE {unique}INDEX "{_short_ident(index_name)}" '
+                f'ON {qualified} ({col_list});'
             )
 
     cur.close()
@@ -1264,14 +1519,16 @@ def build_oracle_constraint_ddl(ora_conn, table_name: str):
 def build_oracle_foreign_key_ddl(ora_conn, table_name: str):
     """Return Oracle-flavoured FOREIGN KEY DDL (str) for a single table."""
     owner = ORACLE_SCHEMA.upper()
-    qualified = f'"{table_name}"'
+    # Emit the Postgres-side (possibly shortened) table name. No-op for <= 63 bytes.
+    qualified = f'"{_short_ident(table_name)}"'
     lines = []
 
     cur = ora_conn.cursor()
     cur.execute(
         """
         SELECT c.constraint_name, c.r_owner, c.r_constraint_name,
-               c.delete_rule, rc.table_name AS ref_table
+               c.delete_rule, rc.table_name AS ref_table,
+               c.deferrable, c.deferred
         FROM all_constraints c
         JOIN all_constraints rc
           ON rc.owner = c.r_owner AND rc.constraint_name = c.r_constraint_name
@@ -1281,21 +1538,29 @@ def build_oracle_foreign_key_ddl(ora_conn, table_name: str):
         """,
         owner=owner, tname=table_name,
     )
-    for cname, r_owner, r_cname, delete_rule, ref_table in cur.fetchall():
+    for (cname, r_owner, r_cname, delete_rule, ref_table,
+         deferrable, deferred) in cur.fetchall():
         local_cols = _constraint_columns(ora_conn, owner, cname)
         ref_cols = _constraint_columns(ora_conn, r_owner, r_cname)
         if not local_cols or not ref_cols:
             continue
-        local_list = ", ".join(f'"{c}"' for c in local_cols)
-        ref_list = ", ".join(f'"{c}"' for c in ref_cols)
+        local_list = ", ".join(f'"{_short_ident(c)}"' for c in local_cols)
+        ref_list = ", ".join(f'"{_short_ident(c)}"' for c in ref_cols)
         # Referenced table is migrated into PG_SCHEMA as well.
         on_delete = ""
         if delete_rule and delete_rule.upper() in ("CASCADE", "SET NULL"):
             on_delete = f" ON DELETE {delete_rule.upper()}"
+        # Preserve deferrability: apps relying on deferred checks (circular FKs,
+        # bulk-swap inserts) break if a DEFERRABLE constraint becomes immediate.
+        deferclause = ""
+        if (deferrable or "").upper() == "DEFERRABLE":
+            mode = "DEFERRED" if (deferred or "").upper() == "DEFERRED" else "IMMEDIATE"
+            deferclause = f" DEFERRABLE INITIALLY {mode}"
         lines.append(
-            f'ALTER TABLE {qualified} ADD CONSTRAINT "{cname}" '
+            f'ALTER TABLE {qualified} ADD CONSTRAINT "{_short_ident(cname)}" '
             f'FOREIGN KEY ({local_list}) '
-            f'REFERENCES "{ref_table}" ({ref_list}){on_delete};'
+            f'REFERENCES "{_short_ident(ref_table)}" ({ref_list}){on_delete}'
+            f'{deferclause};'
         )
     cur.close()
     return "\n".join(lines)
@@ -1316,18 +1581,35 @@ def migrate_table_constraints(ora_conn, pg_conn, table_name: str):
         f.write(f"SET search_path TO {PG_SCHEMA};\n")
         f.write(postgres_ddl)
 
+    # Apply each statement in its OWN transaction (mirrors migrate_foreign_keys).
+    # Oracle CHECKs can use functions with no faithful Postgres equivalent
+    # (DECODE, NVL2, TRUNC(date), 3-arg INSTR, ...). If the whole batch ran in a
+    # single transaction, ONE bad CHECK would roll back the table's PK / UNIQUE /
+    # indexes too. Per-statement isolation means a bad CHECK only loses itself.
     cur = pg_conn.cursor()
+    executed, failed = 0, 0
     try:
-        executed = 0
         for stmt in _split_sql_statements(postgres_ddl):
-            cur.execute(stmt)
-            executed += 1
-        pg_conn.commit()
-        if executed:
-            print(f"  [constr]  {table_name}: applied {executed} constraint/index statements")
-    except Exception:
-        pg_conn.rollback()
-        raise
+            # Skip comment-only / empty statements (e.g. a table with no
+            # constraints still carries the "-- constraints & indexes for X"
+            # header line). Strip SQL line-comments; if nothing real remains,
+            # there is no statement to run. Statements that DO carry SQL after a
+            # leading comment are executed verbatim (Postgres allows the comment).
+            if not re.sub(r"(?m)^\s*--.*$", "", stmt).strip():
+                continue
+            try:
+                cur.execute(stmt)
+                pg_conn.commit()
+                executed += 1
+            except Exception as exc:  # noqa: BLE001
+                pg_conn.rollback()
+                failed += 1
+                gist = " ".join(stmt.split())[:120]
+                print(f"  [constr ERROR] {table_name}: dropped one statement "
+                      f"({exc}): {gist}")
+        if executed or failed:
+            print(f"  [constr]  {table_name}: applied {executed} constraint/index "
+                  f"statement(s)" + (f", {failed} failed" if failed else ""))
     finally:
         cur.close()
         if not KEEP_SQL_FILES:
@@ -1471,11 +1753,16 @@ def migrate_sequences(ora_conn, pg_conn):
 
     cur = ora_conn.cursor()
     cur.execute(
-        """
+        # Raw string: the LIKE pattern needs a literal backslash (ESCAPE '\') so
+        # the '_' in 'ISEQ$$_%' is treated literally, not as a wildcard. Filters
+        # out Oracle's internal IDENTITY-backing sequences (e.g. ISEQ$$_75929),
+        # which are handled by migrate_identity_columns — not as standalone seqs.
+        r"""
         SELECT sequence_name, min_value, max_value, increment_by,
                cycle_flag, cache_size, last_number
         FROM all_sequences
         WHERE sequence_owner = :owner
+          AND sequence_name NOT LIKE 'ISEQ$$\_%' ESCAPE '\'
         ORDER BY sequence_name
         """,
         owner=ORACLE_SCHEMA.upper(),
@@ -1496,38 +1783,63 @@ def migrate_sequences(ora_conn, pg_conn):
 
         minclause = f"MINVALUE {min_v}" if min_v >= _PG_BIGINT_MIN else "NO MINVALUE"
         maxclause = f"MAXVALUE {max_v}" if max_v <= _PG_BIGINT_MAX else "NO MAXVALUE"
-        # Clamp the start value into the representable range as well.
+        # Clamp the start value into the representable range as well. If the real
+        # Oracle high-water mark exceeds Postgres bigint, clamping it DOWN means
+        # the next Postgres-generated value could collide with already-migrated
+        # keys. We can't represent it, so warn loudly and name the sequence.
+        if start > _PG_BIGINT_MAX or start < _PG_BIGINT_MIN:
+            print(
+                f"  [seq WARNING] {name}: Oracle next value {start} exceeds Postgres "
+                f"bigint range; clamping START to "
+                f"{_PG_BIGINT_MAX if start > _PG_BIGINT_MAX else _PG_BIGINT_MIN}. "
+                f"Future inserts may COLLIDE with migrated keys — review this sequence."
+            )
+        # Clamp START into [MINVALUE, MAXVALUE] FIRST: a wrapped CYCLE sequence or a
+        # lowered MAXVALUE can leave the Oracle high-water mark above MAXVALUE, which
+        # Postgres rejects ("START value cannot be greater than MAXVALUE"). Then clamp
+        # into the representable bigint range.
+        start = min(max(start, min_v), max_v)
         start = max(min(start, _PG_BIGINT_MAX), _PG_BIGINT_MIN)
         cacheclause = f"CACHE {int(cache)}" if cache and int(cache) > 1 else "CACHE 1"
         cycleclause = "CYCLE" if (cycle_flag or "N").upper() == "Y" else "NO CYCLE"
 
-        statements.append(
+        statements.append((
+            name,
             f'CREATE SEQUENCE IF NOT EXISTS {_pg_qualified(name)} '
             f'INCREMENT BY {incr} {minclause} {maxclause} '
             f'START WITH {start} {cacheclause} {cycleclause};'
-        )
+        ))
 
     # Dump ➜ (no conversion needed, already Postgres) ➜ load.
-    sql_text = f"SET search_path TO {PG_SCHEMA};\n" + "\n".join(statements) + "\n"
+    sql_text = (
+        f"SET search_path TO {PG_SCHEMA};\n"
+        + "\n".join(stmt for _, stmt in statements) + "\n"
+    )
     pg_path = os.path.join(POSTGRES_DUMP_DIR, "_sequences.sql")
     with open(pg_path, "w", encoding="utf-8") as f:
         f.write(sql_text)
 
-    applied = 0
+    # Apply each CREATE SEQUENCE in its OWN transaction (mirrors
+    # migrate_table_constraints / migrate_foreign_keys). migrate_sequences runs
+    # FIRST in migrate_all_tables; a single bad sequence must NOT roll back the
+    # whole batch or abort the migration before any table loads. Log and continue.
+    applied, failed = 0, 0
     cur = pg_conn.cursor()
     try:
-        for stmt in statements:
-            cur.execute(stmt)
-            applied += 1
-        pg_conn.commit()
-    except Exception:
-        pg_conn.rollback()
-        raise
+        for name, stmt in statements:
+            try:
+                cur.execute(stmt)
+                pg_conn.commit()
+                applied += 1
+            except Exception as exc:  # noqa: BLE001
+                pg_conn.rollback()
+                failed += 1
+                print(f"  [seq ERROR] {name}: {exc}")
     finally:
         cur.close()
         if not KEEP_SQL_FILES:
             os.remove(pg_path)
-    print(f"Sequences: created {applied}")
+    print(f"Sequences: created {applied}" + (f", {failed} failed" if failed else ""))
     return applied
 
 
