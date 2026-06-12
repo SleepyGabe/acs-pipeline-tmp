@@ -257,6 +257,13 @@ checks after every change):
   as plain Python even though `%pip`/`display`/`spark`/`dbutils` only exist at Databricks runtime.
 - Keep the cell structure intact: markdown via `# MAGIC %md`, cell breaks `# COMMAND ----------`.
 - Keep NO WIDGETS — config stays as plain variables in §1.
+- **`.py` is the source of truth** (user's decision). `oracle_to_postgres_migration.ipynb` is a
+  generated mirror — **regenerate it from the `.py` whenever the `.py` changes**, don't hand-edit
+  it. Regeneration: split the `.py` on `\n# COMMAND ----------\n`; `# MAGIC %md` chunks → markdown
+  cells (strip `# MAGIC %md` + `# MAGIC ` prefixes); `# MAGIC %…` chunks (e.g. `%pip`) → code cells
+  (strip `# MAGIC `); everything else → code cells. Emit nbformat 4.0 with
+  `application/vnd.databricks.v1+notebook`/`+cell` metadata + a fresh `nuid` per cell (Databricks
+  export format — match the existing file). The exact converter used is in this session's history.
 - Commit + push to `claude/databricks-notebook-pseudocode-vcc1cs` after a coherent change.
 - The user is iterative and detail-oriented: prefers honest answers about limitations, asks
   pointed questions (e.g. "is it incremental?", "syntax-only?"), and wants robustness.
