@@ -127,8 +127,7 @@ parents-before-children for the *data load*, but FKs still land last for safety.
 | `WORK_DIR` | `/dbfs/tmp/ora2pg` | where intermediate `.sql` (DDL) + `.csv` (data) files go (`oracle/`, `postgres/` subdirs) |
 | `BATCH_SIZE` | 5000 | rows fetched per batch from Oracle (`arraysize`/`fetchmany`) |
 | `MAX_PARALLEL_TABLES` | 8 | **tables migrated concurrently** (thread-pool workers). Each worker uses its own Oracle + Postgres connection → keep ≤ connection limits on BOTH DBs. Set 1 = sequential |
-| `DROP_TARGET_BEFORE_LOAD` | True | `DROP TABLE IF EXISTS` on target first |
-| `CREATE_TARGET_TABLE` | True | run the generated `CREATE TABLE` DDL |
+| `LOAD_MODE` | `"recreate"` | target-table handling: `"recreate"` = DROP CASCADE + CREATE + load + structural passes (full migration); `"truncate"` = table must exist, TRUNCATE then load **data only**; `"append"` = table must exist, load data only (no truncate). Data-only modes **skip ALL structural passes** (constraints/indexes/identity/sequences/FKs) and run a preflight (table exists + columns cover the data) |
 | `CONTINUE_ON_ERROR` | True | keep going if one table fails (failure logged + in summary) |
 | `KEEP_SQL_FILES` | True | keep intermediate `.sql` for auditing |
 | `MIGRATE_PK_UNIQUE_CHECK` | True | 2nd pass: PK/UNIQUE/CHECK constraints |
@@ -169,12 +168,20 @@ to pull every table in `ORACLE_SCHEMA` from `all_tables` (Option B).
 - **SCOPE (documented in-cell):** only ever fed the Step-1 DDL. NOT a general Oracle→Postgres
   transpiler — no `CONNECT BY`, `(+)`, `DECODE`, `MERGE`, PL/SQL. Use `ora2pg` if that changes.
 
-### STEP 3 — load (`load_postgres_copy`)
-- DROP (if `DROP_TARGET_BEFORE_LOAD`) → CREATE from the converted DDL (if `CREATE_TARGET_TABLE`,
-  via the quote-aware `_split_sql_statements`) → **`COPY`** the CSV with `cursor.copy_expert`.
-- Reads the CSV header to pin the `COPY (col, …)` column order, then streams the rest:
-  `FORMAT csv, HEADER false, NULL ''`. Commits per table; rolls back on error.
-- **This replaced per-row INSERTs** — the single biggest speed win for large tables.
+### STEP 3 — load (`load_postgres_copy`) — governed by `LOAD_MODE`
+- `"recreate"`: DROP CASCADE → CREATE from converted DDL (quote-aware `_split_sql_statements`) →
+  COPY. `"truncate"`: `_assert_target_ready` preflight → TRUNCATE → COPY. `"append"`: preflight → COPY.
+- `_assert_target_ready` (data-only modes) checks the table exists and its columns cover the CSV
+  header via `information_schema.columns`; raises a clear error otherwise (before any COPY).
+- COPY: reads CSV header to pin `COPY (col, …)` order, streams rest with `cursor.copy_expert`
+  (`FORMAT csv, HEADER false, NULL ''`). Commits per table; rolls back on error.
+- **Structural passes are gated on `LOAD_MODE == "recreate"`** in `migrate_one_table`
+  (constraints/identity) and `migrate_all_tables` (sequences/FKs) — data-only modes leave the
+  existing schema untouched. `migrate_all_tables` validates `LOAD_MODE` up front.
+- **Caveats of data-only modes:** TRUNCATE on a table referenced by an existing FK fails unless
+  handled (load order / manual); identity sequences are NOT auto-advanced past loaded data
+  (recreate mode does that via `migrate_identity_columns`).
+- COPY replaced per-row INSERTs — the single biggest speed win for large tables.
 
 ### 2nd pass — constraints/indexes/FKs (§5b)
 - Reads `all_constraints`, `all_cons_columns`, `all_indexes`, `all_ind_columns`.

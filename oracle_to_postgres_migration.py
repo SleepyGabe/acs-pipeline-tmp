@@ -75,12 +75,19 @@ MAX_PARALLEL_TABLES = 8                      # how many tables to migrate concur
                                             # Each worker uses its own Oracle + Postgres connection,
                                             # so keep this <= the connection limits on BOTH databases.
                                             # Set to 1 for fully sequential migration.
-DROP_TARGET_BEFORE_LOAD = True              # DROP TABLE IF EXISTS on the Postgres side first
-CREATE_TARGET_TABLE = True                  # emit / run CREATE TABLE DDL on the Postgres side
+# How to handle the target table on the Postgres side:
+#   "recreate" — DROP (CASCADE) + CREATE from the Oracle DDL, then load. Runs ALL the structural
+#                passes below (constraints/indexes/identity/sequences/FKs). Full migration. (default)
+#   "truncate" — table must ALREADY EXIST. TRUNCATE it, then load data only. Skips CREATE and ALL
+#                structural passes (your schema already has them). Use for "replace the data".
+#   "append"   — table must ALREADY EXIST. Load data only (no drop/truncate/create). Skips ALL
+#                structural passes. Use for "add data to what's there" (no dedup — may duplicate).
+LOAD_MODE = "recreate"
+
 CONTINUE_ON_ERROR = True                    # keep migrating remaining tables if one fails
 KEEP_SQL_FILES = True                       # keep intermediate .sql files for auditing
 
-# Constraint / index migration (second pass).
+# Constraint / index migration (second pass). Only applied when LOAD_MODE == "recreate".
 MIGRATE_PK_UNIQUE_CHECK = True              # add PRIMARY KEY / UNIQUE / CHECK constraints
 MIGRATE_INDEXES = True                      # re-create non-constraint indexes
 MIGRATE_FOREIGN_KEYS = True                 # add FOREIGN KEYs (applied last, after all tables load)
@@ -425,10 +432,19 @@ def convert_oracle_sql_text(oracle_sql_text: str) -> str:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 5. STEP 3 — Create the table from DDL, then bulk-load the CSV via `COPY`
+# MAGIC ## 5. STEP 3 — Prepare the target per `LOAD_MODE`, then bulk-load the CSV via `COPY`
 # MAGIC
 # MAGIC `COPY` is used instead of executing per-row `INSERT`s — it streams the whole CSV into
 # MAGIC Postgres in one operation and is typically 10–100× faster on large tables.
+# MAGIC
+# MAGIC **`LOAD_MODE`** controls what happens to a pre-existing target table:
+# MAGIC - `"recreate"` (default) — DROP (CASCADE) + CREATE from the converted DDL, then load. Runs
+# MAGIC   the structural passes (constraints/indexes/identity/sequences/FKs).
+# MAGIC - `"truncate"` — table must already exist; TRUNCATE it, then load **data only** (no DDL,
+# MAGIC   no structural passes).
+# MAGIC - `"append"` — table must already exist; load **data only**, no truncate (rows are added).
+# MAGIC
+# MAGIC In the data-only modes a preflight checks the table exists and its columns cover the data.
 
 # COMMAND ----------
 
@@ -464,18 +480,43 @@ def _split_sql_statements(sql_text: str):
     return [s for s in statements if s]
 
 
+def _assert_target_ready(cur, table_name: str, csv_columns):
+    """For data-only modes: verify the target table exists and has the CSV's columns."""
+    cur.execute(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_schema = %s AND table_name = %s",
+        (PG_SCHEMA, table_name),
+    )
+    existing = {r[0] for r in cur.fetchall()}
+    if not existing:
+        raise RuntimeError(
+            f'LOAD_MODE="{LOAD_MODE}" but target table "{PG_SCHEMA}"."{table_name}" '
+            f"does not exist. Create it first, or use LOAD_MODE=\"recreate\"."
+        )
+    missing = [c for c in csv_columns if c not in existing]
+    if missing:
+        raise RuntimeError(
+            f'Target "{PG_SCHEMA}"."{table_name}" is missing column(s) {missing} '
+            f"present in the Oracle data. Column names must match for COPY."
+        )
+
+
 def load_postgres_copy(pg_conn, postgres_ddl_path: str, csv_path: str, table_name: str):
     """
-    STEP 3: DROP/CREATE the target table from the converted DDL, then bulk-load the CSV
-    with COPY. The CSV's first line is a header giving the column order.
+    STEP 3: Prepare the target table per LOAD_MODE, then bulk-load the CSV with COPY.
+
+    LOAD_MODE:
+      "recreate" — DROP (CASCADE) + CREATE from the converted DDL, then load.
+      "truncate" — TRUNCATE the existing table, then load (data only).
+      "append"   — load into the existing table as-is (data only).
+
+    The CSV's first line is a header giving the column order.
     """
     cur = pg_conn.cursor()
     qualified = f'"{PG_SCHEMA}"."{table_name}"'
     try:
-        if DROP_TARGET_BEFORE_LOAD:
+        if LOAD_MODE == "recreate":
             cur.execute(f"DROP TABLE IF EXISTS {qualified} CASCADE;")
-
-        if CREATE_TARGET_TABLE:
             with open(postgres_ddl_path, "r", encoding="utf-8") as f:
                 for stmt in _split_sql_statements(f.read()):
                     cur.execute(stmt)
@@ -483,6 +524,12 @@ def load_postgres_copy(pg_conn, postgres_ddl_path: str, csv_path: str, table_nam
         # Bulk-load the data. Read the header to pin the column order, then COPY the rest.
         with open(csv_path, "r", encoding="utf-8", newline="") as f:
             header = next(csv.reader([f.readline()]))
+
+            if LOAD_MODE in ("truncate", "append"):
+                _assert_target_ready(cur, table_name, header)
+            if LOAD_MODE == "truncate":
+                cur.execute(f"TRUNCATE TABLE {qualified};")
+
             col_list = ", ".join('"' + c.replace('"', '""') + '"' for c in header)
             copy_sql = (
                 f"COPY {qualified} ({col_list}) "
@@ -492,7 +539,7 @@ def load_postgres_copy(pg_conn, postgres_ddl_path: str, csv_path: str, table_nam
             row_count = cur.rowcount
 
         pg_conn.commit()
-        print(f"  [load]    {table_name}: COPY {row_count} rows")
+        print(f"  [load]    {table_name}: COPY {row_count} rows ({LOAD_MODE})")
     except Exception:
         pg_conn.rollback()
         raise
@@ -1051,8 +1098,11 @@ def migrate_one_table(table_name: str):
         ddl_path, csv_path = dump_oracle_table(ora_conn, table_name)        # STEP 1
         pg_ddl_path = convert_oracle_sql_to_postgres(ddl_path, table_name)  # STEP 2
         load_postgres_copy(pg_conn, pg_ddl_path, csv_path, table_name)      # STEP 3
-        migrate_table_constraints(ora_conn, pg_conn, table_name)           # PK/UNIQUE/CHECK/index
-        migrate_identity_columns(ora_conn, pg_conn, table_name)            # identity columns
+        if LOAD_MODE == "recreate":
+            # Structural passes only when we built the table; in data-only modes
+            # (truncate/append) the target schema already has these.
+            migrate_table_constraints(ora_conn, pg_conn, table_name)       # PK/UNIQUE/CHECK/index
+            migrate_identity_columns(ora_conn, pg_conn, table_name)        # identity columns
 
         if not KEEP_SQL_FILES:
             for p in (ddl_path, csv_path, pg_ddl_path):
@@ -1073,6 +1123,9 @@ def migrate_one_table(table_name: str):
 
 def migrate_all_tables():
     """Run the full dump ➜ convert ➜ COPY pipeline for every table, in parallel."""
+    if LOAD_MODE not in ("recreate", "truncate", "append"):
+        raise ValueError(f'LOAD_MODE must be "recreate", "truncate" or "append", got "{LOAD_MODE}"')
+
     setup_ora = get_oracle_connection()
     setup_pg = get_postgres_connection()
 
@@ -1083,14 +1136,16 @@ def migrate_all_tables():
         table_names = resolve_load_order(setup_ora, table_names)
         total = len(table_names)
         workers = max(1, int(MAX_PARALLEL_TABLES))
-        print(f"Migrating {total} tables with {workers} parallel worker(s)\n" + "=" * 60)
+        print(f"Migrating {total} tables with {workers} parallel worker(s) [LOAD_MODE={LOAD_MODE}]\n"
+              + "=" * 60)
 
         results = {"ok": [], "failed": []}
         start_all = datetime.datetime.now()
 
-        # Standalone sequences: create up front, before the table workers start.
-        migrate_sequences(setup_ora, setup_pg)
-        print("-" * 60)
+        # Standalone sequences: create up front (only when building schema, not in data-only modes).
+        if LOAD_MODE == "recreate":
+            migrate_sequences(setup_ora, setup_pg)
+            print("-" * 60)
 
         # Parallel fan-out: each table is migrated end-to-end on its own connections.
         done = 0
@@ -1107,9 +1162,11 @@ def migrate_all_tables():
                     results["failed"].append((table_name, err))
 
         # FINAL PASS: foreign keys, once every table + its data exists.
-        print("\n" + "-" * 60)
-        ok_in_order = [t for t in table_names if t in set(results["ok"])]
-        migrate_foreign_keys(setup_ora, setup_pg, ok_in_order)
+        # Only when building schema; data-only modes leave existing FKs untouched.
+        if LOAD_MODE == "recreate":
+            print("\n" + "-" * 60)
+            ok_in_order = [t for t in table_names if t in set(results["ok"])]
+            migrate_foreign_keys(setup_ora, setup_pg, ok_in_order)
 
         total_elapsed = (datetime.datetime.now() - start_all).total_seconds()
         print("\n" + "=" * 60)
