@@ -44,8 +44,27 @@ the dependency-aware load ordering and deferred-FK pass both get tested.
 ```bash
 docker compose up -d
 docker compose logs -f oracle      # wait for "DATABASE IS READY TO USE!" (first run: a few minutes)
-docker compose ps                  # both should be (healthy)
+docker compose ps                  # all three should be (healthy)/(running)
 ```
+
+## Run the notebook in the bundled Jupyter server (no cell editing)
+
+`docker compose up -d` also starts a **Jupyter** container with the repo mounted and the
+migration drivers (`python-oracledb`, `psycopg2-binary`) pre-installed. The notebook's cell §1
+reads every connection value from an environment variable (falling back to its placeholder),
+and the compose file sets those vars to point at the `oracle` / `postgres` services — so the
+notebook runs as-is against the local databases.
+
+```text
+http://localhost:8888/lab?token=ora2pg
+```
+
+Open `oracle_to_postgres_migration.ipynb` and **Run All**. Two cells are Databricks-only and can
+be skipped here: the `%pip install … / %restart_python` cell (drivers are already installed) and
+the final `display(...)` / `spark` summary cell. Dump files land in `./ora2pg/` (gitignored).
+
+> Want to point it somewhere else? Override any of the `ORACLE_*` / `PG_*` / `WORK_DIR` vars on
+> the `jupyter` service in `docker-compose.yml`.
 
 Oracle's **first** startup runs the init scripts and takes a while. Subsequent starts are fast
 (data persists in the `oracle-data` / `postgres-data` volumes). To start completely fresh:

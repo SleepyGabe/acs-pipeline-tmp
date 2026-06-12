@@ -93,7 +93,7 @@ parents-before-children for the *data load*, but FKs still land last for safety.
 
 | Cell | Title | Key functions |
 |------|-------|---------------|
-| §0 | Install drivers | `%pip install python-oracledb psycopg2-binary` + `%restart_python` |
+| §0 | Install drivers | `%pip install oracledb psycopg2-binary` + `%restart_python` |
 | §1 | Configuration (NO WIDGETS) | all connection vars + behaviour flags + `TABLE_NAMES` |
 | §2 | Connection helpers | `get_oracle_connection`, `get_postgres_connection` |
 | §3 | **STEP 1** dump (DDL + CSV) | `dump_oracle_table` (→ `(ddl_path, csv_path)`), `_build_create_table_ddl`, `_oracle_column_type`, `_csv_value`, `_oracle_output_type_handler`, `_oracle_quote_ident` |

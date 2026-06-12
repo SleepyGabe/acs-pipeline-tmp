@@ -29,7 +29,7 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install python-oracledb psycopg2-binary
+# MAGIC %pip install oracledb psycopg2-binary
 # MAGIC %restart_python
 
 # COMMAND ----------
@@ -43,30 +43,33 @@ import os
 
 # ----------------------------------------------------------------------------
 # Oracle (SOURCE) connection details
+#   Each value falls back to the literal below, but can be overridden by an
+#   environment variable of the same name. That's what lets the Docker / Jupyter
+#   stack point the notebook at the local containers without editing this cell.
 # ----------------------------------------------------------------------------
-ORACLE_HOST = "oracle-host.example.com"
-ORACLE_PORT = 1521
-ORACLE_SERVICE_NAME = "ORCLPDB1"          # use service name ...
-ORACLE_SID = None                          # ... OR sid (leave one of them None)
-ORACLE_USER = "oracle_user"
-ORACLE_PASSWORD = "oracle_password"        # e.g. dbutils.secrets.get("scope", "oracle_pw")
-ORACLE_SCHEMA = "ORACLE_USER"              # schema that owns the tables (often == user, uppercase)
+ORACLE_HOST = os.getenv("ORACLE_HOST", "oracle-host.example.com")
+ORACLE_PORT = int(os.getenv("ORACLE_PORT", "1521"))
+ORACLE_SERVICE_NAME = os.getenv("ORACLE_SERVICE_NAME", "ORCLPDB1")   # use service name ...
+ORACLE_SID = os.getenv("ORACLE_SID") or None                          # ... OR sid (leave one of them None)
+ORACLE_USER = os.getenv("ORACLE_USER", "oracle_user")
+ORACLE_PASSWORD = os.getenv("ORACLE_PASSWORD", "oracle_password")    # e.g. dbutils.secrets.get("scope", "oracle_pw")
+ORACLE_SCHEMA = os.getenv("ORACLE_SCHEMA", "ORACLE_USER")            # schema that owns the tables (often == user, uppercase)
 
 # ----------------------------------------------------------------------------
 # Postgres (TARGET) connection details
 # ----------------------------------------------------------------------------
-PG_HOST = "postgres-host.example.com"
-PG_PORT = 5432
-PG_DATABASE = "target_db"
-PG_USER = "postgres_user"
-PG_PASSWORD = "postgres_password"          # e.g. dbutils.secrets.get("scope", "pg_pw")
-PG_SCHEMA = "public"                        # target schema in Postgres
-PG_SSLMODE = "prefer"                       # disable | allow | prefer | require | verify-ca | verify-full
+PG_HOST = os.getenv("PG_HOST", "postgres-host.example.com")
+PG_PORT = int(os.getenv("PG_PORT", "5432"))
+PG_DATABASE = os.getenv("PG_DATABASE", "target_db")
+PG_USER = os.getenv("PG_USER", "postgres_user")
+PG_PASSWORD = os.getenv("PG_PASSWORD", "postgres_password")          # e.g. dbutils.secrets.get("scope", "pg_pw")
+PG_SCHEMA = os.getenv("PG_SCHEMA", "public")                          # target schema in Postgres
+PG_SSLMODE = os.getenv("PG_SSLMODE", "prefer")                        # disable | allow | prefer | require | verify-ca | verify-full
 
 # ----------------------------------------------------------------------------
 # Migration behaviour
 # ----------------------------------------------------------------------------
-WORK_DIR = "/dbfs/tmp/ora2pg"               # where the .sql dump files are written
+WORK_DIR = os.getenv("WORK_DIR", "/dbfs/tmp/ora2pg")                 # where the .sql dump files are written
 ORACLE_DUMP_DIR = os.path.join(WORK_DIR, "oracle")
 POSTGRES_DUMP_DIR = os.path.join(WORK_DIR, "postgres")
 
@@ -688,15 +691,27 @@ def _oracle_column_type(data_type, length, precision, scale) -> str:
 
 def _build_create_table_ddl(ora_conn, table_name: str) -> str:
     """Build an Oracle CREATE TABLE statement from the data dictionary (accurate types)."""
+    owner = ORACLE_SCHEMA.upper()
     cur = ora_conn.cursor()
+
+    # Identity columns carry a system sequence as their "default"; that is handled
+    # by the identity pass, so we must NOT emit it as a column DEFAULT here.
+    cur.execute(
+        "SELECT column_name FROM all_tab_identity_cols "
+        "WHERE owner = :owner AND table_name = :tname",
+        owner=owner, tname=table_name,
+    )
+    identity_cols = {r[0] for r in cur.fetchall()}
+
     cur.execute(
         """
-        SELECT column_name, data_type, data_length, data_precision, data_scale, nullable
+        SELECT column_name, data_type, data_length, data_precision, data_scale,
+               nullable, data_default
         FROM all_tab_columns
         WHERE owner = :owner AND table_name = :tname
         ORDER BY column_id
         """,
-        owner=ORACLE_SCHEMA.upper(), tname=table_name,
+        owner=owner, tname=table_name,
     )
     cols = cur.fetchall()
     cur.close()
@@ -704,10 +719,21 @@ def _build_create_table_ddl(ora_conn, table_name: str) -> str:
         raise ValueError(f"No columns found for {ORACLE_SCHEMA}.{table_name}")
 
     col_defs = []
-    for col_name, data_type, length, precision, scale, nullable in cols:
+    for col_name, data_type, length, precision, scale, nullable, data_default in cols:
         col_type = _oracle_column_type(data_type, length, precision, scale)
         not_null = "" if nullable == "Y" else " NOT NULL"
-        col_defs.append(f"    {_oracle_quote_ident(col_name)} {col_type}{not_null}")
+
+        default_clause = ""
+        if col_name not in identity_cols and data_default is not None:
+            # data_default is Oracle source text (LONG); trim and convert the
+            # expression (SYSTIMESTAMP -> CURRENT_TIMESTAMP, NVL -> COALESCE, ...).
+            raw_default = str(data_default).strip()
+            if raw_default and raw_default.upper() != "NULL":
+                default_clause = f" DEFAULT {convert_oracle_sql_text(raw_default).strip()}"
+
+        col_defs.append(
+            f"    {_oracle_quote_ident(col_name)} {col_type}{default_clause}{not_null}"
+        )
 
     return (
         f"-- Oracle DDL for {ORACLE_SCHEMA}.{table_name}\n"
@@ -721,7 +747,13 @@ def _csv_value(value):
     """Format a Python value as Postgres COPY-CSV text. None -> '' (loaded as NULL)."""
     if value is None:
         return None  # csv.writer emits an empty field; COPY ... NULL '' reads it as NULL
+    if isinstance(value, oracledb.LOB):
+        value = value.read()          # CLOB -> str, BLOB -> bytes; then fall through
+        return _csv_value(value)
     if isinstance(value, datetime.datetime):
+        if value.tzinfo is not None:
+            # Preserve the UTC offset for TIMESTAMP WITH (LOCAL) TIME ZONE columns.
+            return value.strftime("%Y-%m-%d %H:%M:%S.%f%z")
         return value.strftime("%Y-%m-%d %H:%M:%S.%f")
     if isinstance(value, datetime.date):
         return value.strftime("%Y-%m-%d")
@@ -811,6 +843,8 @@ _TYPE_RULES = [
     (re.compile(r"\bBINARY_DOUBLE\b", re.IGNORECASE), "DOUBLE PRECISION"),
     (re.compile(r"\bBINARY_FLOAT\b", re.IGNORECASE), "REAL"),
     (re.compile(r"\bFLOAT\b", re.IGNORECASE), "DOUBLE PRECISION"),
+    # Postgres has no "WITH LOCAL TIME ZONE"; it's a timestamptz -> normalise it.
+    (re.compile(r"\bWITH\s+LOCAL\s+TIME\s+ZONE\b", re.IGNORECASE), "WITH TIME ZONE"),
     # Oracle DATE carries a time component -> map to TIMESTAMP in Postgres.
     (re.compile(r"\bDATE\b", re.IGNORECASE), "TIMESTAMP"),
 ]
@@ -916,25 +950,53 @@ def convert_oracle_sql_text(oracle_sql_text: str) -> str:
 
 def _split_sql_statements(sql_text: str):
     """
-    Split a SQL script into individual statements on semicolons,
-    ignoring semicolons that appear inside single-quoted string literals.
+    Split a SQL script into individual statements on semicolons, ignoring
+    semicolons inside single-quoted string literals ('' escaping), double-quoted
+    identifiers ("" escaping), and dollar-quoted strings ($tag$ ... $tag$).
     """
     statements = []
     buf = []
-    in_string = False
+    in_string = False        # inside '...'
+    in_ident = False         # inside "..."
+    dollar_tag = None        # the active $tag$ delimiter, or None
     i = 0
     n = len(sql_text)
+    _dollar_re = re.compile(r"\$[A-Za-z_0-9]*\$")
     while i < n:
         ch = sql_text[i]
+
+        # Dollar-quoted string: match opening/closing $tag$ only when not in a quote.
+        if not in_string and not in_ident:
+            m = _dollar_re.match(sql_text, i)
+            if m:
+                tok = m.group(0)
+                if dollar_tag is None:
+                    dollar_tag = tok
+                elif dollar_tag == tok:
+                    dollar_tag = None
+                buf.append(tok)
+                i = m.end()
+                continue
+
+        if dollar_tag is not None:
+            buf.append(ch)
+            i += 1
+            continue
+
         buf.append(ch)
-        if ch == "'":
-            # Handle escaped '' inside a string literal.
+        if ch == "'" and not in_ident:
             if in_string and i + 1 < n and sql_text[i + 1] == "'":
                 buf.append(sql_text[i + 1])
                 i += 2
                 continue
             in_string = not in_string
-        elif ch == ";" and not in_string:
+        elif ch == '"' and not in_string:
+            if in_ident and i + 1 < n and sql_text[i + 1] == '"':
+                buf.append(sql_text[i + 1])
+                i += 2
+                continue
+            in_ident = not in_ident
+        elif ch == ";" and not in_string and not in_ident:
             stmt = "".join(buf).strip()
             if stmt and stmt != ";":
                 statements.append(stmt.rstrip(";").strip())
@@ -1038,6 +1100,62 @@ def _pg_qualified(table_name: str) -> str:
     return f"{_pg_ident(PG_SCHEMA)}.{_pg_ident(table_name)}"
 
 
+def _pg_column_type(pg_cur, table_name: str, column_name: str):
+    """Return the Postgres data_type for a column, or None if it doesn't exist."""
+    pg_cur.execute(
+        "SELECT data_type FROM information_schema.columns "
+        "WHERE table_schema = %s AND table_name = %s AND column_name = %s",
+        (PG_SCHEMA, table_name, column_name),
+    )
+    row = pg_cur.fetchone()
+    return row[0] if row else None
+
+
+def _table_columns(ora_conn, owner: str, table_name: str):
+    """All column names for a table (used to quote identifiers in CHECK conditions)."""
+    cur = ora_conn.cursor()
+    cur.execute(
+        """
+        SELECT column_name
+        FROM all_tab_columns
+        WHERE owner = :owner AND table_name = :tname
+        """,
+        owner=owner, tname=table_name,
+    )
+    cols = [r[0] for r in cur.fetchall()]
+    cur.close()
+    return cols
+
+
+# Matches: a double-quoted identifier, OR a single-quoted string literal
+# (Oracle '' escaping), OR a bare identifier. Order matters so quoted regions
+# are consumed whole and never rewritten.
+_CHECK_TOKEN_RE = re.compile(
+    r'"[^"]*"|\'(?:[^\']|\'\')*\'|[A-Za-z_][A-Za-z0-9_$#]*'
+)
+
+
+def _quote_check_condition(cond: str, columns) -> str:
+    """
+    Quote bare column identifiers in an Oracle CHECK search_condition so they
+    survive Postgres' unquoted-folds-to-lowercase rule. Columns are created
+    quoted/upper-case, so an unquoted ``ACTIVE`` would fold to ``active`` and
+    fail with "column does not exist". String literals and already-quoted
+    identifiers are left untouched.
+    """
+    colset = {c.upper() for c in columns}
+
+    def repl(m):
+        tok = m.group(0)
+        if tok[0] in ('"', "'"):  # quoted identifier or string literal
+            return tok
+        if tok.upper() in colset:
+            return '"' + tok.upper() + '"'
+        return tok
+
+    return _CHECK_TOKEN_RE.sub(repl, cond)
+
+
 def _constraint_columns(ora_conn, owner: str, constraint_name: str):
     """Ordered column list for a given constraint."""
     cur = ora_conn.cursor()
@@ -1063,6 +1181,7 @@ def build_oracle_constraint_ddl(ora_conn, table_name: str):
     owner = ORACLE_SCHEMA.upper()
     qualified = f'"{table_name}"'
     lines = [f"-- constraints & indexes for {table_name}"]
+    table_cols = _table_columns(ora_conn, owner, table_name)
 
     cur = ora_conn.cursor()
 
@@ -1094,6 +1213,7 @@ def build_oracle_constraint_ddl(ora_conn, table_name: str):
                 # Skip the system-generated "COL" IS NOT NULL checks (already NOT NULL in DDL).
                 if not cond or re.match(r'^"?\w+"?\s+IS\s+NOT\s+NULL$', cond, re.IGNORECASE):
                     continue
+                cond = _quote_check_condition(cond, table_cols)
                 lines.append(
                     f'ALTER TABLE {qualified} ADD CONSTRAINT "{cname}" CHECK ({cond});'
                 )
@@ -1215,6 +1335,61 @@ def migrate_table_constraints(ora_conn, pg_conn, table_name: str):
             os.remove(pg_path)
 
 
+_PG_INT_TYPES = ("smallint", "integer", "bigint")
+
+
+def align_foreign_key_column_types(ora_conn, pg_conn, table_names):
+    """
+    Before applying FKs, make each child FK column's Postgres type match its
+    referenced parent column. Oracle NUMBER keys map to NUMERIC, but identity
+    parents get coerced to bigint — and Postgres rejects a numeric->bigint FK.
+    Only acts when the parent column is an integer type and the child differs.
+    """
+    owner = ORACLE_SCHEMA.upper()
+    cur = pg_conn.cursor()
+    aligned = 0
+    try:
+        for table_name in table_names:
+            ocur = ora_conn.cursor()
+            ocur.execute(
+                """
+                SELECT c.constraint_name, c.r_owner, c.r_constraint_name,
+                       rc.table_name AS ref_table
+                FROM all_constraints c
+                JOIN all_constraints rc
+                  ON rc.owner = c.r_owner AND rc.constraint_name = c.r_constraint_name
+                WHERE c.owner = :owner AND c.table_name = :tname
+                  AND c.constraint_type = 'R' AND c.status = 'ENABLED'
+                """,
+                owner=owner, tname=table_name,
+            )
+            fks = ocur.fetchall()
+            ocur.close()
+            for cname, r_owner, r_cname, ref_table in fks:
+                local_cols = _constraint_columns(ora_conn, owner, cname)
+                ref_cols = _constraint_columns(ora_conn, r_owner, r_cname)
+                for lcol, rcol in zip(local_cols, ref_cols):
+                    ptype = _pg_column_type(cur, ref_table, rcol)
+                    ctype = _pg_column_type(cur, table_name, lcol)
+                    if ptype in _PG_INT_TYPES and ctype is not None and ctype != ptype:
+                        col = _pg_ident(lcol)
+                        try:
+                            cur.execute(
+                                f"ALTER TABLE {_pg_qualified(table_name)} "
+                                f"ALTER COLUMN {col} TYPE {ptype} USING {col}::{ptype};"
+                            )
+                            pg_conn.commit()
+                            aligned += 1
+                        except Exception as exc:  # noqa: BLE001
+                            pg_conn.rollback()
+                            print(f"  [fk type] could not align {table_name}.{lcol} "
+                                  f"-> {ptype}: {exc}")
+    finally:
+        cur.close()
+    if aligned:
+        print(f"Foreign keys: aligned {aligned} child column type(s) to parent")
+
+
 def migrate_foreign_keys(ora_conn, pg_conn, table_names):
     """
     Final pass: dump ➜ convert ➜ load all FOREIGN KEYs once every table exists.
@@ -1222,6 +1397,9 @@ def migrate_foreign_keys(ora_conn, pg_conn, table_names):
     """
     if not MIGRATE_FOREIGN_KEYS:
         return 0
+
+    # Type-align child FK columns to their (possibly bigint-coerced) parents first.
+    align_foreign_key_column_types(ora_conn, pg_conn, table_names)
 
     all_fk_lines = []
     for table_name in table_names:
@@ -1381,8 +1559,23 @@ def migrate_identity_columns(ora_conn, pg_conn, table_name: str):
 
             # Find the current max so the identity sequence resumes past migrated data.
             pgcur.execute(f"SELECT COALESCE(MAX({col}), 0) FROM {qualified}")
-            current_max = pgcur.fetchone()[0] or 0
+            current_max = int(pgcur.fetchone()[0] or 0)
 
+            # Postgres IDENTITY (and sequences) are bigint-bound. An Oracle NUMBER key
+            # holding values beyond bigint can't be a PG identity at all — leave it as
+            # NUMERIC (data preserved) and warn rather than crash on an overflowing cast.
+            if current_max > _PG_BIGINT_MAX:
+                print(f"  [ident]   SKIP {table_name}.{column_name}: max {current_max} "
+                      f"exceeds bigint; left as NUMERIC without identity.")
+                continue
+
+            # Oracle identity columns are NUMBER, which this converter maps to NUMERIC.
+            # Postgres IDENTITY only accepts smallint/integer/bigint, so coerce to bigint
+            # (data is already loaded; the cast is safe for the integer values Oracle stores).
+            pgcur.execute(
+                f"ALTER TABLE {qualified} ALTER COLUMN {col} "
+                f"TYPE bigint USING {col}::bigint;"
+            )
             pgcur.execute(
                 f"ALTER TABLE {qualified} ALTER COLUMN {col} "
                 f"ADD GENERATED {gen} AS IDENTITY;"

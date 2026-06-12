@@ -38,7 +38,7 @@ echo ">> Creating Python venv and installing drivers..."
 VENV="$ROOT/.venv-test"
 python3 -m venv "$VENV"
 "$VENV/bin/pip" install --quiet --upgrade pip
-"$VENV/bin/pip" install --quiet python-oracledb psycopg2-binary
+"$VENV/bin/pip" install --quiet oracledb psycopg2-binary
 
 echo ">> Running migration + row-count verification..."
 set +e

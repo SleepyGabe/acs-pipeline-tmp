@@ -12,7 +12,13 @@
 --   * standalone SEQUENCE       -> tests migrate_sequences
 --   * PRIMARY KEY / UNIQUE / CHECK constraints + INDEX -> tests 2nd pass
 --   * FOREIGN KEY (ORDERS -> CUSTOMERS)                 -> tests FK pass + load ordering
+--
+-- gvenzl runs every init script as `sqlplus -s / as sysdba`, which connects to
+-- CDB$ROOT. The APP_USER lives in the XEPDB1 PDB, so we MUST switch containers
+-- first or every qualified reference fails with ORA-01918 (user does not exist).
 -- ---------------------------------------------------------------------------
+
+ALTER SESSION SET CONTAINER = XEPDB1;
 
 -- Parent table: identity PK, unique email, check constraint, CLOB, timestamp.
 CREATE TABLE ORACLE_USER.CUSTOMERS (

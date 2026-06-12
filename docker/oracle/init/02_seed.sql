@@ -1,7 +1,12 @@
 -- ---------------------------------------------------------------------------
 -- Seed data for the test schema. CUSTOMER_ID is identity-generated (1,2,3);
 -- ORDER_ID is drawn from ORDER_SEQ (1000, 1001, ...).
+--
+-- Runs as `/ as sysdba` (CDB$ROOT) under gvenzl — switch to the PDB where
+-- ORACLE_USER lives, same as 01_schema.sql.
 -- ---------------------------------------------------------------------------
+
+ALTER SESSION SET CONTAINER = XEPDB1;
 
 INSERT INTO ORACLE_USER.CUSTOMERS (NAME, EMAIL, BALANCE, ACTIVE, NOTES)
     VALUES ('Alice Smith', 'alice@example.com', 1500.50, 1, 'VIP customer - priority support');
