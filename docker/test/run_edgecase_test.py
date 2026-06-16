@@ -437,7 +437,7 @@ def verify_postgres(ns):
           isid and isid[0] == "YES", str(isid))
 
     print("\n--- F1: virtual/generated column materialized (EDGE_VCOL) ---")
-    cur.execute("SELECT to_regclass(%s)", (f'{sch}.\"EDGE_VCOL\"',))
+    cur.execute("SELECT to_regclass(%s)", (f'\"{sch}\".\"EDGE_VCOL\"',))
     check("EDGE_VCOL table exists (not lost to DEFAULT col-ref crash)",
           cur.fetchone()[0] is not None)
     cur.execute(f'SELECT "FULLNAME" FROM "{sch}"."EDGE_VCOL" WHERE "FNAME"=%s', ("Jane",))
@@ -466,7 +466,7 @@ def verify_postgres(ns):
     check("NUL byte stripped ('ab\\x00cd' -> 'abcd')", t and t[0] == "abcd", str(t))
 
     print("\n--- F4: ROWID column mapped to text (EDGE_ROWID) ---")
-    cur.execute("SELECT to_regclass(%s)", (f'{sch}.\"EDGE_ROWID\"',))
+    cur.execute("SELECT to_regclass(%s)", (f'\"{sch}\".\"EDGE_ROWID\"',))
     check("EDGE_ROWID table exists (ROWID not emitted verbatim)",
           cur.fetchone()[0] is not None)
     rid = col("EDGE_ROWID", "rid")
@@ -500,7 +500,7 @@ def verify_postgres(ns):
           cur.fetchone()[0] == 0)
 
     print("\n--- F6: >63-byte identifiers hash-shortened distinctly (EDGE_LONGID) ---")
-    cur.execute("SELECT to_regclass(%s)", (f'{sch}.\"EDGE_LONGID\"',))
+    cur.execute("SELECT to_regclass(%s)", (f'\"{sch}\".\"EDGE_LONGID\"',))
     check("EDGE_LONGID table exists (no DuplicateColumn truncation collision)",
           cur.fetchone()[0] is not None)
     cur.execute("SELECT column_name FROM information_schema.columns "
@@ -566,7 +566,25 @@ def main():
     overrides["TABLE_NAMES"] = list(FIXTURES)
     overrides["DISCOVER_TABLES"] = False
     overrides["RESPECT_LOAD_ORDER"] = True
+    # Deliberately migrate into a schema whose name is NOT a bare-legal SQL
+    # identifier (the dash). This reproduces the production incident where every
+    # table failed with `SET search_path TO acs-migration` -> 'syntax error at
+    # or near "-"'. Forced (not env-derived) so the `_pg_search_path` quoting (and
+    # every `_pg_qualified` reference) is exercised end-to-end on EVERY run — a
+    # regression can never slip through silently. The container ships PG_SCHEMA=public
+    # in its env, which is exactly why we must not read it here.
+    overrides["PG_SCHEMA"] = "acs-migration"
     ns = R.load_notebook_namespace(overrides)
+
+    # The migration assumes its target schema already exists (it never issues
+    # CREATE SCHEMA). Create it up front, quoted, exactly as the real operator
+    # would have done for "acs-migration".
+    sch = ns["PG_SCHEMA"]
+    pg = ns["get_postgres_connection"]()
+    pg.autocommit = True
+    pg.cursor().execute(f'CREATE SCHEMA IF NOT EXISTS {ns["_pg_ident"](sch)}')
+    pg.close()
+    print(f"=== Target schema: {sch!r} (quoted as {ns['_pg_ident'](sch)}) ===")
 
     print("=== Setting up Oracle fixtures ===")
     setup_oracle(ns)

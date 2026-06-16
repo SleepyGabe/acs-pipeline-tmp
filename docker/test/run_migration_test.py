@@ -29,6 +29,14 @@ EXPECTED_TABLES = ["CUSTOMERS", "ORDERS"]
 def build_overrides():
     """Connection + behaviour overrides pointing the notebook at the Docker stack."""
     tmp = tempfile.mkdtemp(prefix="ora2pg_test_")
+    # Create the oracle/ and postgres/ subdirs we override below. The notebook
+    # normally creates them itself (via _resolve_work_dir at config time), but it
+    # does so for its OWN env-derived WORK_DIR — and we then override WORK_DIR /
+    # *_DUMP_DIR to `tmp` *after* that cell has run, so nothing creates tmp/oracle
+    # or tmp/postgres. Without this, the first file write (migrate_sequences ->
+    # _sequences.sql) dies with FileNotFoundError.
+    os.makedirs(os.path.join(tmp, "oracle"), exist_ok=True)
+    os.makedirs(os.path.join(tmp, "postgres"), exist_ok=True)
     return {
         # Oracle (source)
         "ORACLE_HOST": os.environ.get("ORACLE_HOST", "localhost"),

@@ -69,12 +69,55 @@ PG_SSLMODE = os.getenv("PG_SSLMODE", "prefer")                        # disable 
 # ----------------------------------------------------------------------------
 # Migration behaviour
 # ----------------------------------------------------------------------------
-WORK_DIR = os.getenv("WORK_DIR", "/dbfs/tmp/ora2pg")                 # where the .sql dump files are written
+WORK_DIR_BASE = os.getenv("WORK_DIR", "/local_disk0/tmp/ora2pg")    # fast node-local SSD; set WORK_DIR to override
+
+
+def _resolve_work_dir(base):
+    """Return a work dir whose oracle/ and postgres/ subdirs are writable.
+
+    A fixed shared path like /local_disk0/tmp/ora2pg is node-local and ephemeral
+    on Databricks; on a rerun under a different identity (interactive vs job /
+    service principal) or a different cluster node, that dir may already exist
+    owned by someone else as drwxr-xr-x, so it (and any subdir of it) can't be
+    written -> PermissionError (errno 13); note exist_ok=True only suppresses
+    FileExistsError, not this.
+
+    The fallbacks are *siblings* (base-<user>, base-<uuid>), not children of
+    `base`: a child of an unwritable dir can't be created either, and we want to
+    stay on the same fast volume rather than drop to the root /tmp. The parent of
+    `base` (e.g. /local_disk0/tmp) is normally sticky-bit world-writable, so each
+    identity can create and reuse its own sibling without blocking others.
+
+    Imports are function-local on purpose: each Databricks `# COMMAND ----------`
+    is its own cell, so a module-level `import getpass`/`uuid` in another cell may
+    not be in scope when this runs. Importing here makes the helper self-contained.
+    """
+    import os
+    import getpass
+    import uuid
+
+    candidates = [
+        base,
+        f"{base}-{getpass.getuser()}",                # per-user, reused across reruns
+        f"{base}-{uuid.uuid4().hex}",                 # last resort, unique per run
+    ]
+    last_err = None
+    for path in candidates:
+        try:
+            os.makedirs(os.path.join(path, "oracle"), exist_ok=True)
+            os.makedirs(os.path.join(path, "postgres"), exist_ok=True)
+            return path
+        except OSError as exc:                                       # not usable here (perms, file in the way, ...) -> try next
+            last_err = exc
+    raise PermissionError(f"No writable work dir among {candidates!r}: {last_err}")
+
+
+WORK_DIR = _resolve_work_dir(WORK_DIR_BASE)
 ORACLE_DUMP_DIR = os.path.join(WORK_DIR, "oracle")
 POSTGRES_DUMP_DIR = os.path.join(WORK_DIR, "postgres")
 
-BATCH_SIZE = 5_000                          # rows fetched per batch from Oracle
-MAX_PARALLEL_TABLES = 8                      # how many tables to migrate concurrently (thread pool).
+BATCH_SIZE = 20_000                         # rows fetched per batch from Oracle
+MAX_PARALLEL_TABLES = 10                     # how many tables to migrate concurrently (thread pool).
                                             # Each worker uses its own Oracle + Postgres connection,
                                             # so keep this <= the connection limits on BOTH databases.
                                             # Set to 1 for fully sequential migration.
@@ -644,9 +687,10 @@ def get_postgres_connection():
     )
 
 
-# Make sure the working directories exist.
-os.makedirs(ORACLE_DUMP_DIR, exist_ok=True)
-os.makedirs(POSTGRES_DUMP_DIR, exist_ok=True)
+# Working directories were created (and verified writable) when WORK_DIR was
+# resolved above; warn if we had to fall back off the requested base.
+if WORK_DIR != WORK_DIR_BASE:
+    print(f"WARNING: {WORK_DIR_BASE!r} was not writable; fell back to {WORK_DIR!r}")
 print(f"Oracle dump dir   : {ORACLE_DUMP_DIR}")
 print(f"Postgres dump dir : {POSTGRES_DUMP_DIR}")
 
@@ -1089,7 +1133,7 @@ def convert_oracle_sql_to_postgres(oracle_sql_path: str, table_name: str) -> str
          open(out_path, "w", encoding="utf-8") as dst:
 
         dst.write(f"-- Converted from Oracle dump: {os.path.basename(oracle_sql_path)}\n")
-        dst.write(f"SET search_path TO {PG_SCHEMA};\n\n")
+        dst.write(_pg_search_path() + "\n\n")
 
         in_ddl = False
         for raw_line in src:
@@ -1310,6 +1354,45 @@ def _pg_ident(name: str) -> str:
 
 def _pg_qualified(table_name: str) -> str:
     return f"{_pg_ident(PG_SCHEMA)}.{_pg_ident(table_name)}"
+
+
+def _pg_search_path() -> str:
+    """The `SET search_path TO <schema>;` line prefixed to every emitted Postgres SQL file.
+
+    PG_SCHEMA MUST be quoted. An unquoted schema whose name isn't a bare-legal SQL
+    identifier is a syntax error: a dash is the one that bit us
+    (`SET search_path TO acs-migration` -> 'syntax error at or near "-"'), but the
+    same breaks on a leading digit, an embedded space/dot, mixed case you need
+    preserved, or a reserved word. `_pg_ident` quotes it (and escapes any embedded
+    ") exactly as `_pg_qualified` does for every table / sequence reference, so the
+    search_path and the qualified names always resolve to the SAME schema.
+
+    Centralised in one place precisely so the several emission sites can never
+    drift back to interpolating the raw, unquoted name again."""
+    return f"SET search_path TO {_pg_ident(PG_SCHEMA)};"
+
+
+def _pg_set_session_search_path(conn):
+    """Apply `SET search_path` to CONN's session, committed so it survives later rollbacks.
+
+    The structural passes (constraints, foreign keys, sequences) split an *in-memory*
+    DDL string and execute the statements one by one — that string does NOT carry the
+    leading `SET search_path` line we write to the .sql file, so without this the
+    session keeps its DEFAULT search_path. The per-table CREATE TABLE path doesn't have
+    this problem: it executes the .sql *file*, whose first statement IS the SET.
+
+    It matters because FK `REFERENCES <parent>` is emitted UNqualified and resolves via
+    search_path. Under a non-default target schema (e.g. "acs-migration") the parent
+    lives outside the default path, so every FK would silently fail to create — which is
+    exactly what happened until this was added. Sequences/constraints are schema-qualified
+    and don't strictly need it, but we set it uniformly so no structural statement can
+    ever resolve against the wrong schema."""
+    cur = conn.cursor()
+    try:
+        cur.execute(_pg_search_path())
+        conn.commit()
+    finally:
+        cur.close()
 
 
 def _pg_column_type(pg_cur, table_name: str, column_name: str):
@@ -1578,7 +1661,7 @@ def migrate_table_constraints(ora_conn, pg_conn, table_name: str):
     with open(ora_path, "w", encoding="utf-8") as f:
         f.write(oracle_ddl)
     with open(pg_path, "w", encoding="utf-8") as f:
-        f.write(f"SET search_path TO {PG_SCHEMA};\n")
+        f.write(_pg_search_path() + "\n")
         f.write(postgres_ddl)
 
     # Apply each statement in its OWN transaction (mirrors migrate_foreign_keys).
@@ -1586,6 +1669,7 @@ def migrate_table_constraints(ora_conn, pg_conn, table_name: str):
     # (DECODE, NVL2, TRUNC(date), 3-arg INSTR, ...). If the whole batch ran in a
     # single transaction, ONE bad CHECK would roll back the table's PK / UNIQUE /
     # indexes too. Per-statement isolation means a bad CHECK only loses itself.
+    _pg_set_session_search_path(pg_conn)   # resolve unqualified names to PG_SCHEMA
     cur = pg_conn.cursor()
     executed, failed = 0, 0
     try:
@@ -1701,10 +1785,11 @@ def migrate_foreign_keys(ora_conn, pg_conn, table_names):
     with open(ora_path, "w", encoding="utf-8") as f:
         f.write(oracle_ddl)
     with open(pg_path, "w", encoding="utf-8") as f:
-        f.write(f"SET search_path TO {PG_SCHEMA};\n")
+        f.write(_pg_search_path() + "\n")
         f.write(postgres_ddl)
 
     applied, failed = 0, 0
+    _pg_set_session_search_path(pg_conn)   # so unqualified FK REFERENCES targets resolve to PG_SCHEMA
     cur = pg_conn.cursor()
     for stmt in _split_sql_statements(postgres_ddl):
         try:
@@ -1812,7 +1897,7 @@ def migrate_sequences(ora_conn, pg_conn):
 
     # Dump ➜ (no conversion needed, already Postgres) ➜ load.
     sql_text = (
-        f"SET search_path TO {PG_SCHEMA};\n"
+        _pg_search_path() + "\n"
         + "\n".join(stmt for _, stmt in statements) + "\n"
     )
     pg_path = os.path.join(POSTGRES_DUMP_DIR, "_sequences.sql")
@@ -1824,6 +1909,7 @@ def migrate_sequences(ora_conn, pg_conn):
     # FIRST in migrate_all_tables; a single bad sequence must NOT roll back the
     # whole batch or abort the migration before any table loads. Log and continue.
     applied, failed = 0, 0
+    _pg_set_session_search_path(pg_conn)   # keep the session schema uniform across passes
     cur = pg_conn.cursor()
     try:
         for name, stmt in statements:
