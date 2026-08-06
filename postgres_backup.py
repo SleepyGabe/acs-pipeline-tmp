@@ -94,7 +94,7 @@ PG_PORT = int(os.getenv("PG_PORT", "5432"))
 PG_DATABASE = os.getenv("PG_DATABASE", "target_db")
 PG_USER = os.getenv("PG_USER", "postgres_user")
 PG_PASSWORD = os.getenv("PG_PASSWORD", "postgres_password")          # e.g. dbutils.secrets.get("scope", "pg_pw")
-PG_SCHEMA = os.getenv("PG_SCHEMA", "public")                          # only used when LIMIT_TO_SCHEMA is True
+PG_SCHEMA = os.getenv("PG_SCHEMA", "public")                          # default schema (used by the INCLUDE_SCHEMAS example below)
 PG_SSLMODE = os.getenv("PG_SSLMODE", "prefer")                        # disable | allow | prefer | require | verify-ca | verify-full
 
 # ----------------------------------------------------------------------------
@@ -118,16 +118,36 @@ BACKUP_FILENAME = os.getenv("BACKUP_FILENAME") or None
 #   "custom" -> a compressed .dump, restored with `pg_restore` (selective/parallel restore)
 BACKUP_FORMAT = "plain"
 
-LIMIT_TO_SCHEMA = False        # False = back up the WHOLE database; True = only PG_SCHEMA (pg_dump --schema)
-SCHEMA_ONLY = False            # True = DDL only, no row data (pg_dump --schema-only)
+SCHEMA_ONLY = False           # True = DDL only, no row data (pg_dump --schema-only)
 DATA_ONLY = False             # True = row data only, no DDL    (pg_dump --data-only)
+
+# ----------------------------------------------------------------------------
+# SCOPE — back up only PART of the database. This is how you keep a multi-TB DB's
+# dump small: you only ever dump what you list here. Leave ALL FOUR empty to back
+# up the whole database. Patterns use pg_dump's syntax ('*' and '?' wildcards);
+# an entry with no '.' matches a table in any schema. These map 1:1 to pg_dump
+# object-selection flags, and the §3 size estimate reflects exactly this selection.
+# ----------------------------------------------------------------------------
+INCLUDE_SCHEMAS    = []        # whole schemas to dump, e.g. ["reporting", "public"]      (pg_dump --schema)
+INCLUDE_TABLES     = []        # specific tables to dump, e.g. ["public.customers", "public.orders"]  (pg_dump --table)
+EXCLUDE_TABLES     = []        # tables to drop ENTIRELY (DDL + data), e.g. ["public.*_tmp"]  (pg_dump --exclude-table)
+EXCLUDE_TABLE_DATA = []        # tables to keep as EMPTY (DDL only, ROWS dropped), e.g. ["public.audit_*", "*_log"]  (pg_dump --exclude-table-data)
+
+# ----------------------------------------------------------------------------
+# DISK GUARD — refuse to start (nothing is written) unless the selection fits.
+#   The §3 preflight estimates the on-disk size of the selected data and aborts
+#   BEFORE pg_dump runs if it would blow the budget or the destination's free
+#   space. This is what prevents a runaway dump from filling your volume.
+# ----------------------------------------------------------------------------
+MAX_DUMP_BYTES    = 50 * 1024**3   # hard ceiling for the estimated dump. Set to None to disable the budget check.
+FREE_SPACE_SAFETY = 1.5            # require estimate * this much free space at BACKUP_OUTPUT_DIR before starting.
 
 NO_OWNER = True               # strip ownership (restore as the connecting role) — portable across servers
 NO_PRIVILEGES = True          # strip GRANT/REVOKE (ACLs) — portable across servers
 INCLUDE_DROP = True           # emit DROP ... IF EXISTS before each CREATE (--clean --if-exists) — clean re-restore
 INCLUDE_CREATE_DATABASE = False  # emit CREATE DATABASE + \connect (--create); restore into a maintenance db (e.g. postgres)
 
-# Any extra raw pg_dump flags you want to pass through, e.g. ["--exclude-table=audit.*"].
+# Any extra raw pg_dump flags you want to pass through, e.g. ["--no-comments"].
 EXTRA_PG_DUMP_ARGS = []
 
 # ----------------------------------------------------------------------------
@@ -175,21 +195,47 @@ print(f"Backup file      : {BACKUP_PATH}")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 3. Pre-flight: connectivity + `pg_dump` vs server version check
-# MAGIC `pg_dump` refuses to dump from a server **newer** than itself, so we verify the client major is
-# MAGIC `>=` the server major up front and give a clear message instead of a cryptic failure mid-dump.
+# MAGIC ## 3. Pre-flight: version check, **scope resolution, size estimate & disk guard**
+# MAGIC This cell is the safety gate. It:
+# MAGIC 1. verifies `pg_dump` is new enough for the server (it refuses to dump from a *newer* server);
+# MAGIC 2. resolves exactly which tables your SCOPE selection will dump, and sums their on-disk size;
+# MAGIC 3. **aborts here — before a single byte is written** — if that estimate blows `MAX_DUMP_BYTES`
+# MAGIC    or won't fit the destination's free space (so a runaway dump can't fill your volume);
+# MAGIC 4. warns about any foreign key from a selected table to a table you're *not* backing up (would break restore into an empty DB).
 
 # COMMAND ----------
 
 import re
+import fnmatch
 import shutil
 import subprocess
+import psycopg2
 
 if shutil.which("pg_dump") is None:
     raise RuntimeError("pg_dump not found on PATH — run the install cell (§0) first.")
 
-# Server major version, via a normal libpq connection.
-import psycopg2
+
+def _human(n):
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB", "PiB"):
+        if abs(n) < 1024 or unit == "PiB":
+            return f"{n:,.2f} {unit}"
+        n /= 1024
+
+
+def _matches(schema, name, patterns):
+    """True if 'schema.name' matches any pg_dump-style pattern in `patterns`.
+    A pattern with no '.' matches the table name in any schema."""
+    fq = f"{schema}.{name}"
+    for p in patterns:
+        if "." in p:
+            if fnmatch.fnmatchcase(fq, p):
+                return True
+        elif fnmatch.fnmatchcase(name, p):
+            return True
+    return False
+
+
+# ---- one connection for the whole preflight ----
 _conn = psycopg2.connect(host=PG_HOST, port=PG_PORT, dbname=PG_DATABASE,
                          user=PG_USER, password=PG_PASSWORD, sslmode=PG_SSLMODE)
 try:
@@ -198,24 +244,139 @@ try:
         server_num = int(cur.fetchone()[0])
         cur.execute("SHOW server_version;")
         server_version = cur.fetchone()[0]
+
+        # Every data-bearing user relation with its on-disk sizes.
+        cur.execute(
+            """
+            SELECT n.nspname, c.relname,
+                   pg_total_relation_size(c.oid) AS total_bytes,
+                   pg_table_size(c.oid)          AS data_bytes
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.relkind IN ('r', 'p', 'm')            -- table, partitioned table, matview
+              AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+              AND n.nspname NOT LIKE 'pg\\_toast%'
+              AND n.nspname NOT LIKE 'pg\\_temp%';
+            """
+        )
+        all_tables = [(s, t, int(tot), int(dat)) for s, t, tot, dat in cur.fetchall()]
+
+        # Foreign keys: (child_schema, child, parent_schema, parent).
+        cur.execute(
+            """
+            SELECT ns.nspname, cl.relname, fns.nspname, fcl.relname
+            FROM pg_constraint con
+            JOIN pg_class cl      ON cl.oid  = con.conrelid
+            JOIN pg_namespace ns  ON ns.oid  = cl.relnamespace
+            JOIN pg_class fcl     ON fcl.oid = con.confrelid
+            JOIN pg_namespace fns ON fns.oid = fcl.relnamespace
+            WHERE con.contype = 'f';
+            """
+        )
+        fkeys = cur.fetchall()
 finally:
     _conn.close()
 server_major = server_num // 10000
 
-# Client major version, from `pg_dump --version` (e.g. "pg_dump (PostgreSQL) 16.3").
+# --- version gate ---
+# `pg_dump --version` prints e.g. "pg_dump (PostgreSQL) 16.13 (Ubuntu 16.13-0ubuntu0.24.04.1)"
+# — take the number right after "(PostgreSQL)", falling back to the first "<major>.<minor>".
 _out = subprocess.run(["pg_dump", "--version"], text=True, capture_output=True).stdout
-_m = re.search(r"(\d+)(?:\.\d+)?\s*$", _out.strip())
+_m = re.search(r"PostgreSQL\)\s+(\d+)", _out) or re.search(r"\b(\d+)\.\d+", _out)
 client_major = int(_m.group(1)) if _m else -1
-
 print(f"Server : {server_version} (major {server_major})")
 print(f"pg_dump: {_out.strip()} (major {client_major})")
-
 if client_major < server_major:
     raise RuntimeError(
         f"pg_dump major {client_major} is OLDER than the server major {server_major}. "
         f"Set PG_CLIENT_MAJOR='{server_major}' in §0 and re-run the install cell."
     )
-print("OK: pg_dump is new enough to back up this server.")
+
+# --- resolve the SCOPE selection (mirrors what pg_dump will actually dump) ---
+_no_include = not (INCLUDE_SCHEMAS or INCLUDE_TABLES)
+
+
+def _selected(schema, name):
+    if _no_include:
+        included = True                                   # whole DB
+    else:
+        included = (any(fnmatch.fnmatchcase(schema, p) for p in INCLUDE_SCHEMAS)
+                    or _matches(schema, name, INCLUDE_TABLES))
+    if not included or _matches(schema, name, EXCLUDE_TABLES):
+        return False
+    return True
+
+
+selected = [(s, t, tot, dat) for (s, t, tot, dat) in all_tables if _selected(s, t)]
+selected_names = {(s, t) for (s, t, _, _) in selected}
+
+# --- foreign-key closure check (would the restore break?) ---
+dangling = [(cs, ct, ps, pt) for (cs, ct, ps, pt) in fkeys
+            if (cs, ct) in selected_names and (ps, pt) not in selected_names]
+
+# --- size estimate: data of selected tables, MINUS tables whose data we exclude ---
+_data_excluded = {(s, t) for (s, t, _, _) in selected if _matches(s, t, EXCLUDE_TABLE_DATA)}
+if SCHEMA_ONLY:
+    est_bytes = 0                                          # DDL only — negligible
+else:
+    est_bytes = sum(dat for (s, t, tot, dat) in selected if (s, t) not in _data_excluded)
+
+print(f"\nScope: {'WHOLE DATABASE' if _no_include else 'PARTIAL'} — "
+      f"{len(selected)} of {len(all_tables)} tables selected"
+      + (f", {len(_data_excluded)} kept as empty (data excluded)" if _data_excluded else ""))
+for (s, t, tot, dat) in sorted(selected, key=lambda r: -r[3])[:15]:
+    tag = "  [data excluded]" if (s, t) in _data_excluded else ""
+    print(f"   {s}.{t:<40} data={_human(dat):>12}{tag}")
+if len(selected) > 15:
+    print(f"   ... and {len(selected) - 15} more")
+print(f"\nEstimated dump data size (uncompressed, approx): {_human(est_bytes)}")
+
+# --- disk guard: abort BEFORE writing anything ---
+if MAX_DUMP_BYTES is not None and est_bytes > MAX_DUMP_BYTES:
+    raise RuntimeError(
+        f"ABORT: estimated {_human(est_bytes)} exceeds MAX_DUMP_BYTES={_human(MAX_DUMP_BYTES)}. "
+        f"Narrow the SCOPE (INCLUDE_* / EXCLUDE_TABLE_DATA) or raise MAX_DUMP_BYTES. "
+        f"Nothing was written."
+    )
+try:
+    free = shutil.disk_usage(BACKUP_OUTPUT_DIR).free
+    need = est_bytes * FREE_SPACE_SAFETY
+    print(f"Free at destination: {_human(free)} (need ~{_human(need)} incl. {FREE_SPACE_SAFETY}x safety)")
+    if est_bytes and free < need:
+        raise RuntimeError(
+            f"ABORT: only {_human(free)} free at {BACKUP_OUTPUT_DIR}, need ~{_human(need)}. "
+            f"Nothing was written."
+        )
+except OSError:
+    print(f"NOTE: could not read free space for {BACKUP_OUTPUT_DIR} "
+          f"(common for FUSE-mounted Volumes) — relying on the MAX_DUMP_BYTES budget instead.")
+
+# --- FK warning (only when we did NOT auto-include) ---
+if dangling:
+    print("\nWARNING: these foreign keys point at tables OUTSIDE the backup scope. The dump is valid,")
+    print("but restoring into an EMPTY database will fail these FKs unless the parent tables already")
+    print("exist there. To make it self-contained, add the parents (right-hand side) to INCLUDE_TABLES")
+    print("— but note pg_dump does not emit CREATE SCHEMA for --table-only dumps, so a parent in a")
+    print("non-'public' schema also needs that schema created on the target first:")
+    for (cs, ct, ps, pt) in dangling[:20]:
+        print(f"   {cs}.{ct}  ->  {ps}.{pt}")
+    if len(dangling) > 20:
+        print(f"   ... and {len(dangling) - 20} more")
+
+# --- canonical pg_dump object-selection args, consumed verbatim by §4 ---
+# Pass the user's include/exclude patterns straight through to pg_dump; §3's estimate
+# above mirrors exactly this selection.
+SCOPE_ARGS = []
+for s in INCLUDE_SCHEMAS:
+    SCOPE_ARGS += ["--schema", s]
+for t in INCLUDE_TABLES:
+    SCOPE_ARGS += ["--table", t]
+for t in EXCLUDE_TABLES:
+    SCOPE_ARGS += ["--exclude-table", t]
+for t in EXCLUDE_TABLE_DATA:
+    SCOPE_ARGS += ["--exclude-table-data", t]
+
+print("\nOK: pre-flight passed — proceeding to dump.")
 
 # COMMAND ----------
 
@@ -242,8 +403,7 @@ cmd = [
     "--no-password",   # never prompt interactively; rely on PGPASSWORD below
     "--verbose",       # progress goes to stderr
 ]
-if LIMIT_TO_SCHEMA:
-    cmd += ["--schema", PG_SCHEMA]
+cmd += SCOPE_ARGS                       # scope resolved & size-checked in §3 (INCLUDE_*/EXCLUDE_*)
 if SCHEMA_ONLY:
     cmd += ["--schema-only"]
 if DATA_ONLY:
