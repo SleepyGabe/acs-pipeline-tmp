@@ -636,17 +636,23 @@ with open(OUTPUT_PATH, "r", errors="replace") as fh:
     text = fh.read()
 
 n_create = len(re.findall(r"(?m)^\s*CREATE\s+", text))
-data_lines = [ln for ln in text.splitlines()
-              if re.match(r"^\s*(COPY\s+.+\bFROM stdin|INSERT INTO)\b", ln)]
+# This generator only reads the catalog (via pg_get_*def / CREATE TABLE assembly) and
+# NEVER emits table rows. DML like INSERT/UPDATE can legitimately appear INSIDE function
+# or trigger bodies (they're part of the routine's DDL), so we must NOT flag those.
+# The only thing that would indicate real dumped data is a pg_dump-style bulk COPY block,
+# which we never produce — that's the sole marker we guard against.
+copy_data = [ln for ln in text.splitlines() if re.match(r"^COPY\s+\S+.*\bFROM stdin;", ln)]
 
 print(f"File   : {OUTPUT_PATH}")
 print(f"Size   : {size:,} bytes ({size / 1024:.1f} KiB)")
 print(f"CREATE statements: {n_create}")
 if size == 0 or n_create == 0:
     raise RuntimeError("DDL file has no CREATE statements — something went wrong.")
-if data_lines:
-    raise RuntimeError(f"Unexpected DATA found ({len(data_lines)} line(s)) — this should be schema-only!")
-print("OK: file contains DDL and NO table data.")
+if copy_data:
+    raise RuntimeError(f"Unexpected bulk data found ({len(copy_data)} COPY block(s)) — this should be schema-only!")
+print("OK: file is schema-only DDL (no bulk table data).")
+print("     Note: INSERT/UPDATE text may appear inside function/trigger bodies — that is part of")
+print("     the routine's definition, not dumped rows.")
 
 print("\n--- restore (into a server where the databases already exist) ---")
 print(f"export PGPASSWORD='<password>'")
