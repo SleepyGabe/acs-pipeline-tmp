@@ -26,49 +26,52 @@
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 0. Install the Postgres client tools (`pg_dump` / `pg_dumpall`)
-# MAGIC Same as the backup notebook: `postgresql-client` is an OS package, not a Python lib. `pg_dump`'s major
-# MAGIC version must be **>= the server's**; installs from PGDG pinned to `PG_CLIENT_MAJOR`.
+# MAGIC ## 0. Get the Postgres client tools (`pg_dump` / `pg_dumpall`) — **no root needed**
+# MAGIC `pg_dump` is a **binary**, not a Python library. On a **managed cluster you usually can't `apt-get`**
+# MAGIC (no root — that's the `Permission denied ... dpkg lock` error). This cell avoids apt entirely:
+# MAGIC
+# MAGIC 1. if `pg_dump` is already on `PATH`, it's used as-is; otherwise
+# MAGIC 2. it installs the **`pgserver`** pip wheel, which *bundles* the Postgres client binaries into your
+# MAGIC    notebook's Python env — pure user space, no root, no apt.
+# MAGIC
+# MAGIC `pgserver` ships PG 16 client tools; the §3 version check still enforces client-major >= server-major.
+# MAGIC (If your workspace mandates notebook-scoped installs, replace the pip line with a separate
+# MAGIC `%pip install pgserver` cell — the binary-resolution logic below is unchanged.)
 
 # COMMAND ----------
 
-# Major version of the postgresql-client to install. MUST be >= the server's major
-# version. The reference docker stack runs postgres:16, so 16 is a safe default.
-PG_CLIENT_MAJOR = "16"
-
+import os
+import sys
 import shutil
 import subprocess
 
-def _sh(cmd):
-    """Run a shell command, streaming output; raise on failure."""
-    print(f"$ {cmd}")
-    res = subprocess.run(cmd, shell=True, text=True,
-                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    print(res.stdout)
-    if res.returncode != 0:
-        raise RuntimeError(f"command failed ({res.returncode}): {cmd}")
 
-existing = shutil.which("pg_dump")
-if existing:
-    print(f"pg_dump already present at {existing}")
-    _sh("pg_dump --version")
-else:
-    # Add the PGDG repo so we can install the exact client major version, then install it.
-    try:
-        _sh("apt-get update -qq")
-        _sh("apt-get install -y -qq curl ca-certificates gnupg lsb-release")
-        _sh("install -d /usr/share/postgresql-common/pgdg")
-        _sh("curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc "
-            "-o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc")
-        _sh('echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] '
-            'http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" '
-            '> /etc/apt/sources.list.d/pgdg.list')
-        _sh("apt-get update -qq")
-        _sh(f"apt-get install -y -qq postgresql-client-{PG_CLIENT_MAJOR}")
-    except RuntimeError:
-        print("PGDG install failed; falling back to the distro's default postgresql-client")
-        _sh("apt-get install -y -qq postgresql-client")
-    _sh("pg_dump --version")
+def _resolve_pg_bindir():
+    """Return a directory containing pg_dump/pg_dumpall, without needing root or apt.
+    Prefer PATH; otherwise pip-install `pgserver`, which bundles the client binaries."""
+    onpath = shutil.which("pg_dump")
+    if onpath:
+        print(f"pg_dump already on PATH: {onpath}")
+        return os.path.dirname(onpath)
+    print("pg_dump not on PATH — installing the `pgserver` wheel (bundles the client binaries; no root)...")
+    subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "pgserver"], check=True)
+    import pgserver
+    bindir = os.path.join(os.path.dirname(pgserver.__file__), "pginstall", "bin")
+    if not os.path.exists(os.path.join(bindir, "pg_dump")):        # layout changed? locate it by walking
+        for root, _dirs, files in os.walk(os.path.dirname(pgserver.__file__)):
+            if "pg_dump" in files:
+                bindir = root
+                break
+    return bindir
+
+
+# Absolute paths used by every later cell (so we never depend on PATH again).
+PG_BIN_DIR = _resolve_pg_bindir()
+PG_DUMP    = os.path.join(PG_BIN_DIR, "pg_dump")
+PG_DUMPALL = os.path.join(PG_BIN_DIR, "pg_dumpall")
+PSQL       = os.path.join(PG_BIN_DIR, "psql")
+print("Using pg_dump   :", PG_DUMP)
+print(subprocess.run([PG_DUMP, "--version"], text=True, capture_output=True).stdout.strip())
 
 # COMMAND ----------
 
@@ -163,12 +166,16 @@ print(f"DDL file         : {OUTPUT_PATH}")
 # COMMAND ----------
 
 import re
+import os
 import shutil
 import subprocess
 import psycopg2
 
-if shutil.which("pg_dump") is None:
-    raise RuntimeError("pg_dump not found on PATH — run the install cell (§0) first.")
+# Binary paths come from §0. Fall back to PATH if this cell is run on its own.
+PG_DUMP = globals().get("PG_DUMP") or shutil.which("pg_dump")
+PG_DUMPALL = globals().get("PG_DUMPALL") or shutil.which("pg_dumpall")
+if not PG_DUMP or not os.path.exists(PG_DUMP):
+    raise RuntimeError("pg_dump not available — run the install cell (§0) first.")
 
 
 def pg_connect(dbname):
@@ -203,7 +210,7 @@ finally:
     _boot.close()
 server_major = server_num // 10000
 
-_out = subprocess.run(["pg_dump", "--version"], text=True, capture_output=True).stdout
+_out = subprocess.run([PG_DUMP, "--version"], text=True, capture_output=True).stdout
 _m = re.search(r"PostgreSQL\)\s+(\d+)", _out) or re.search(r"\b(\d+)\.\d+", _out)
 client_major = int(_m.group(1)) if _m else -1
 print(f"Server        : {server_version} (major {server_major})")
@@ -254,7 +261,7 @@ def _base_pg_dump_args():
 def run_pg_dump(dbname, schemas, exclude_tables):
     """Run pg_dump --schema-only for `dbname`, scoped to `schemas`, excluding `exclude_tables`.
     Returns (ok, sql_text, stderr_text)."""
-    cmd = ["pg_dump", "--host", PG_HOST, "--port", str(PG_PORT),
+    cmd = [PG_DUMP, "--host", PG_HOST, "--port", str(PG_PORT),
            "--username", PG_USER, "--dbname", dbname] + _base_pg_dump_args()
     if ADD_CREATE_DATABASE:
         cmd.append("--create")
@@ -315,7 +322,7 @@ skipped = []             # human-readable notes about anything we skipped
 
 # --- globals (roles + tablespaces) ---
 if INCLUDE_GLOBALS:
-    gcmd = ["pg_dumpall", "--host", PG_HOST, "--port", str(PG_PORT), "--username", PG_USER,
+    gcmd = [PG_DUMPALL, "--host", PG_HOST, "--port", str(PG_PORT), "--username", PG_USER,
             "--globals-only", "--no-role-passwords", "--no-password", "-l", PG_DATABASE]
     if NO_OWNER:
         gcmd.append("--no-owner")
